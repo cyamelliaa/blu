@@ -22,7 +22,7 @@
 #include <elf.h>
 #include <link.h>
 
-#include "GlossHook.h"
+#include "dobby.h"
 #include "imgui.h"
 #include "imgui_impl_opengl3.h"
 #include "imgui_impl_android.h"
