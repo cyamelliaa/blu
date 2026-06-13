@@ -23,7 +23,7 @@ jobs:
         run: git clone --depth=1 https://github.com/ocornut/imgui deps/imgui
 
       - name: Clone GlossHook
-        run: git clone --depth=1 https://github.com/axhlzy/GlossHook deps/GlossHook
+        run: git clone --depth=1 https://github.com/XMDS/GlossHook deps/GlossHook
 
       - name: Build
         run: |
