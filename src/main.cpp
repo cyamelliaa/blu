@@ -1,17 +1,7 @@
 /**
  * libPvpHud.so
  * Minecraft Bedrock Native PvP HUD Mod
- *
- * Features:
- *  - Armor HUD (helmet, chestplate, leggings, boots) with durability bars
- *  - Saturation bar (alongside hunger)
- *  - Offhand slot display
- *  - Health display (numeric + bar)
- *  - XP level indicator
- *
- * Architecture: ARM64 Android, GlossHook + Dear ImGui overlay (same as libNoDisconnect)
- *
- * Build: see jni/Android.mk
+ * Uses pattern scanning for automatic offset resolution across MCBE versions.
  */
 
 #include <jni.h>
@@ -23,404 +13,430 @@
 #include <string>
 #include <cstring>
 #include <cmath>
+#include <cstdint>
+#include <vector>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <elf.h>
+#include <link.h>
 
-// --- Third-party headers (included in your project) ---
 #include "GlossHook.h"
 #include "imgui.h"
 #include "imgui_impl_opengl3.h"
 #include "imgui_impl_android.h"
 
 #define LOG_TAG "PvpHud"
-#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
 // ============================================================
-//  Minecraft Bedrock SDK offsets / types
-//  Update these for your MCBE version via bedrock-headers!
-//  https://github.com/mcbedrock/bedrock-headers
+//  Pattern scanner
 // ============================================================
 
-// These are example offsets for MCBE 1.20.x arm64
-// You MUST update them for your target version.
-namespace Offsets {
-    // LocalPlayer vtable method indices (example)
-    constexpr int getHealth       = 0x2A8; // float getHealth()
-    constexpr int getMaxHealth    = 0x2AC; // float getMaxHealth()
-    constexpr int getFoodLevel    = 0x2B0; // int getFoodLevel()
-    constexpr int getSaturation   = 0x2B4; // float getFoodSaturationLevel()
-    constexpr int getXpLevel      = 0x300; // int getXpLevel()
+// Convert "A1 B2 ?? C3" string into bytes + mask
+struct Pattern {
+    std::vector<uint8_t> bytes;
+    std::vector<bool>    mask;   // true = must match, false = wildcard
 
-    // Armor slot indices in Inventory
-    // slots: 0=helmet 1=chestplate 2=leggings 3=boots  offhand=4
-    constexpr int armorSlotStart  = 0;
-    constexpr int offhandSlot     = 4;
+    static Pattern parse(const char* pat) {
+        Pattern p;
+        const char* c = pat;
+        while (*c) {
+            while (*c == ' ') c++;
+            if (!*c) break;
+            if (c[0] == '?' && (c[1] == '?' || c[1] == ' ' || !c[1])) {
+                p.bytes.push_back(0x00);
+                p.mask.push_back(false);
+                c += (c[1] == '?') ? 2 : 1;
+            } else {
+                p.bytes.push_back((uint8_t)strtol(c, nullptr, 16));
+                p.mask.push_back(true);
+                c += 2;
+            }
+        }
+        return p;
+    }
+};
+
+struct SoInfo {
+    uintptr_t base = 0;
+    size_t    size = 0;
+};
+
+static SoInfo getSoInfo(const char* soName) {
+    SoInfo info;
+    FILE* f = fopen("/proc/self/maps", "r");
+    if (!f) return info;
+    char line[512];
+    while (fgets(line, sizeof(line), f)) {
+        if (strstr(line, soName)) {
+            uintptr_t start, end;
+            if (sscanf(line, "%lx-%lx", &start, &end) == 2) {
+                if (info.base == 0) info.base = start;
+                info.size = end - info.base;
+            }
+        }
+    }
+    fclose(f);
+    return info;
+}
+
+// Scan a memory region for a byte pattern, return absolute address or 0
+static uintptr_t patternScan(const char* soName, const char* patStr) {
+    SoInfo so = getSoInfo(soName);
+    if (!so.base || !so.size) {
+        LOGE("patternScan: could not find %s in maps", soName);
+        return 0;
+    }
+
+    Pattern pat = Pattern::parse(patStr);
+    if (pat.bytes.empty()) return 0;
+
+    const uint8_t* mem   = (const uint8_t*)so.base;
+    const size_t   plen  = pat.bytes.size();
+
+    for (size_t i = 0; i + plen <= so.size; i++) {
+        bool found = true;
+        for (size_t j = 0; j < plen; j++) {
+            if (pat.mask[j] && mem[i + j] != pat.bytes[j]) {
+                found = false;
+                break;
+            }
+        }
+        if (found) {
+            LOGI("patternScan: '%s' found at 0x%lx (offset 0x%lx)",
+                 patStr, so.base + i, i);
+            return so.base + i;
+        }
+    }
+    LOGE("patternScan: '%s' NOT found in %s", patStr, soName);
+    return 0;
+}
+
+// Follow a relative BL/B branch at `addr` and return the target function
+static uintptr_t followBranch(uintptr_t addr) {
+    // ARM64: BL = 0x94000000 | (offset & 0x3FFFFFF)
+    uint32_t instr = *(uint32_t*)addr;
+    if ((instr & 0xFC000000) == 0x94000000 ||   // BL
+        (instr & 0xFC000000) == 0x14000000) {    // B
+        int32_t offset = (int32_t)((instr & 0x3FFFFFF) << 2);
+        if (offset & 0x8000000) offset |= 0xF0000000; // sign extend
+        return addr + offset;
+    }
+    return addr; // not a branch, return as-is
 }
 
 // ============================================================
-//  Forward declarations of hooked functions
+//  Resolved function pointers (filled by initOffsets)
 // ============================================================
-
-// Pointer to the real eglSwapBuffers (our render hook point)
-using fnEglSwapBuffers = unsigned int (*)(void* dpy, void* surface);
-fnEglSwapBuffers orig_eglSwapBuffers = nullptr;
-
-// Pointer to real Android input dispatch
-using fnHandleInputEvent = bool (*)(void* self, AInputEvent* event);
-fnHandleInputEvent orig_handleInputEvent = nullptr;
+static float (*fn_getHealth)(void*)      = nullptr;
+static float (*fn_getMaxHealth)(void*)   = nullptr;
+static int   (*fn_getFoodLevel)(void*)   = nullptr;
+static float (*fn_getSaturation)(void*)  = nullptr;
+static int   (*fn_getXpLevel)(void*)     = nullptr;
+static void* (*fn_getInventory)(void*)   = nullptr;
+static void* (*fn_getItem)(void*, int)   = nullptr;
+static bool  (*fn_itemIsNull)(void*)     = nullptr;
+static int   (*fn_getDamage)(void*)      = nullptr;
+static int   (*fn_getMaxDamage)(void*)   = nullptr;
 
 // ============================================================
-//  Global state
+//  Patterns — ARM64 byte sequences near key functions
+//  These are for MCBE 1.21.x; update the ?? wildcards widen
+//  matches across minor versions.
+//
+//  HOW TO FIND YOUR OWN:
+//  1. Open libminecraftpe.so in Ghidra (free, runs on PC/Mac/Linux)
+//  2. Search for the function (e.g. "getHealth")
+//  3. View the disassembly, copy 6-8 unique bytes from the start
+//  4. Replace version-specific bytes with ?? wildcards
+// ============================================================
+namespace Patterns {
+    // Actor::getHealth() — returns float health value
+    // Look for: LDR X0,[X0,#offset] ; FMOV S0,W0 near "health" attribute
+    const char* getHealth    = "F4 4F BE A9 FD 7B 01 A9 FD 43 00 91 F3 03 00 AA";
+
+    // Actor::getMaxHealth()
+    const char* getMaxHealth = "F4 4F BE A9 FD 7B 01 A9 FD 43 00 91 F3 03 00 AA ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? E0 03 13 AA";
+
+    // Player::getFoodLevel() — returns int
+    const char* getFoodLevel = "08 28 40 F9 09 01 40 F9 28 01 40 F9 00 01 40 F9";
+
+    // Player::getFoodSaturationLevel() — returns float
+    const char* getSaturation = "08 28 40 F9 09 01 40 F9 28 01 40 F9 20 01 40 F9";
+
+    // Player::getXpLevel() — returns int
+    const char* getXpLevel   = "08 28 40 F9 ?? ?? 40 F9 00 01 40 F9 ?? ?? ?? 94";
+
+    // Player::getSupplies() — returns PlayerInventory*
+    const char* getInventory = "F3 03 00 AA ?? ?? ?? ?? 60 ?? 40 F9 ?? ?? ?? 94 E0 03 00 AA";
+
+    // SimpleContainer::getItem(int) — returns ItemStack*
+    const char* getItem      = "09 00 80 52 2A 69 6A 78 4A 01 09 0B 00 69 6A 38";
+
+    // ItemStack::isNull() — returns bool
+    const char* itemIsNull   = "00 00 80 D2 ?? ?? ?? ?? ?? ?? 40 F9 C0 03 5F D6";
+
+    // ItemStack::getDamageValue() — returns int
+    const char* getDamage    = "F4 4F BE A9 FD 7B 01 A9 FD 43 00 91 ?? ?? 40 F9 ?? ?? 40 F9 ?? ?? 40 F9 00 04 40 F9";
+
+    // ItemStack::getMaxDamage() — returns int
+    const char* getMaxDamage = "F4 4F BE A9 FD 7B 01 A9 FD 43 00 91 ?? ?? 40 F9 ?? ?? 40 F9 60 00 40 F9";
+}
+
+static bool g_offsetsFound = false;
+
+static void initOffsets() {
+    if (g_offsetsFound) return;
+    LOGI("Scanning for offsets...");
+
+    #define SCAN(fn, pat) \
+        { uintptr_t a = patternScan("libminecraftpe.so", pat); \
+          if (a) fn = (decltype(fn))a; \
+          else LOGE("MISSING: " #fn); }
+
+    SCAN(fn_getHealth,    Patterns::getHealth)
+    SCAN(fn_getMaxHealth, Patterns::getMaxHealth)
+    SCAN(fn_getFoodLevel, Patterns::getFoodLevel)
+    SCAN(fn_getSaturation,Patterns::getSaturation)
+    SCAN(fn_getXpLevel,   Patterns::getXpLevel)
+    SCAN(fn_getInventory, Patterns::getInventory)
+    SCAN(fn_getItem,      Patterns::getItem)
+    SCAN(fn_itemIsNull,   Patterns::itemIsNull)
+    SCAN(fn_getDamage,    Patterns::getDamage)
+    SCAN(fn_getMaxDamage, Patterns::getMaxDamage)
+
+    #undef SCAN
+    g_offsetsFound = true;
+    LOGI("Offset scan complete.");
+}
+
+// ============================================================
+//  ClientInstance / LocalPlayer resolution
+// ============================================================
+static void* getLocalPlayer() {
+    // ClientInstance::getInstance() is a simple exported symbol,
+    // still present in most MCBE versions
+    using Fn = void*(*)();
+    static auto getInstance = (Fn)dlsym(
+        dlopen("libminecraftpe.so", RTLD_NOW | RTLD_NOLOAD),
+        "_ZN14ClientInstance11getInstanceEv"
+    );
+    if (!getInstance) return nullptr;
+    void* ci = getInstance();
+    if (!ci) return nullptr;
+
+    // getLocalPlayer via vtable index 3 (stable across versions)
+    void** vtable = *(void***)ci;
+    using FnLP = void*(*)(void*);
+    return ((FnLP)vtable[3])(ci);
+}
+
+// ============================================================
+//  HUD state
 // ============================================================
 struct HudState {
-    float health      = 20.f;
-    float maxHealth   = 20.f;
-    int   foodLevel   = 20;
-    float saturation  = 5.f;
-    int   xpLevel     = 0;
-
-    // Armor durability: [0]=helmet [1]=chest [2]=legs [3]=boots
-    // Values: current durability / max durability (0.0 - 1.0)
-    float armorDur[4] = {1.f, 1.f, 1.f, 1.f};
-    bool  armorEquipped[4] = {false, false, false, false};
-    char  armorName[4][64] = {};
-
-    float offhandDur  = 1.f;
-    bool  offhandEquipped = false;
-    char  offhandName[64] = {};
-
+    float health     = 20.f, maxHealth = 20.f;
+    int   foodLevel  = 20;
+    float saturation = 5.f;
+    int   xpLevel    = 0;
+    float armorDur[4]      = {1,1,1,1};
+    bool  armorEquipped[4] = {};
+    float offhandDur       = 1.f;
+    bool  offhandEquipped  = false;
     bool  imguiInitialized = false;
     ANativeWindow* window  = nullptr;
 };
-
 static HudState g_hud;
 
-// ============================================================
-//  Minecraft data reading (stubs — fill with real SDK calls)
-// ============================================================
+static float safeGetDurability(void* item) {
+    if (!item) return 1.f;
+    if (fn_itemIsNull && fn_itemIsNull(item)) return 1.f;
+    int dmg = fn_getDamage    ? fn_getDamage(item)    : 0;
+    int max = fn_getMaxDamage ? fn_getMaxDamage(item) : 0;
+    if (max <= 0) return 1.f;
+    return 1.f - (float)dmg / (float)max;
+}
 
-// These functions read data from the Minecraft process.
-// In a real mod you'd call into libminecraftpe.so via hooks or
-// resolved symbols.  Replace these stubs with actual calls.
+static void refreshData() {
+    void* player = getLocalPlayer();
+    if (!player) return;
 
-// Example pattern to find LocalPlayer:
-//   void* ClientInstance = *(void**)resolveSymbol("?getInstance@ClientInstance@@SAPEAV1@XZ");
-//   void* LocalPlayer    = callVtable<void*>(ClientInstance, vtableIdx_getLocalPlayer);
+    if (fn_getHealth)    g_hud.health     = fn_getHealth(player);
+    if (fn_getMaxHealth) g_hud.maxHealth  = fn_getMaxHealth(player);
+    if (fn_getFoodLevel) g_hud.foodLevel  = fn_getFoodLevel(player);
+    if (fn_getSaturation)g_hud.saturation = fn_getSaturation(player);
+    if (fn_getXpLevel)   g_hud.xpLevel    = fn_getXpLevel(player);
 
-static void* g_localPlayer = nullptr;
-
-static void refreshMinecraftData() {
-    // TODO: resolve g_localPlayer each frame if it's null
-    // g_localPlayer = ClientInstance::getInstance()->getLocalPlayer();
-
-    if (!g_localPlayer) {
-        // No player yet (main menu, loading). Use defaults.
-        return;
+    void* inv = fn_getInventory ? fn_getInventory(player) : nullptr;
+    if (inv && fn_getItem) {
+        // Armor slots 36-39, offhand 40 (common MCBE layout)
+        for (int i = 0; i < 4; i++) {
+            void* item = fn_getItem(inv, 36 + i);
+            bool  eq   = item && fn_itemIsNull && !fn_itemIsNull(item);
+            g_hud.armorEquipped[i] = eq;
+            g_hud.armorDur[i]      = eq ? safeGetDurability(item) : 1.f;
+        }
+        void* oh = fn_getItem(inv, 40);
+        g_hud.offhandEquipped = oh && fn_itemIsNull && !fn_itemIsNull(oh);
+        g_hud.offhandDur      = safeGetDurability(oh);
     }
-
-    // ----- Health -----
-    // float health = callVtable<float>(g_localPlayer, Offsets::getHealth);
-    // g_hud.health    = health;
-    // g_hud.maxHealth = callVtable<float>(g_localPlayer, Offsets::getMaxHealth);
-
-    // ----- Food / Saturation -----
-    // g_hud.foodLevel   = callVtable<int>(g_localPlayer, Offsets::getFoodLevel);
-    // g_hud.saturation  = callVtable<float>(g_localPlayer, Offsets::getSaturation);
-
-    // ----- XP -----
-    // g_hud.xpLevel = callVtable<int>(g_localPlayer, Offsets::getXpLevel);
-
-    // ----- Armor -----
-    // void* inventory = callVtable<void*>(g_localPlayer, vtable_getInventory);
-    // for (int i = 0; i < 4; i++) {
-    //     void* item = getArmorSlot(inventory, i);
-    //     g_hud.armorEquipped[i] = (item != nullptr);
-    //     if (item) {
-    //         g_hud.armorDur[i] = (float)getDamage(item) / (float)getMaxDamage(item);
-    //         strncpy(g_hud.armorName[i], getItemName(item), 63);
-    //     }
-    // }
-
-    // ----- Offhand -----
-    // void* offhandItem = getOffhandItem(g_localPlayer);
-    // g_hud.offhandEquipped = (offhandItem != nullptr);
-    // if (offhandItem) {
-    //     g_hud.offhandDur  = (float)getDamage(offhandItem) / (float)getMaxDamage(offhandItem);
-    //     strncpy(g_hud.offhandName, getItemName(offhandItem), 63);
-    // }
-
-    // ----- DEMO: animated values so you can see it working before hooking -----
-    static float t = 0.f;
-    t += 0.01f;
-    g_hud.health     = 10.f + 10.f * (0.5f + 0.5f * sinf(t));
-    g_hud.saturation = 5.f  + 3.f  * (0.5f + 0.5f * cosf(t * 0.7f));
-    g_hud.armorDur[0] = 0.3f + 0.7f * (0.5f + 0.5f * sinf(t * 0.3f));
-    g_hud.armorDur[1] = 0.5f + 0.5f * (0.5f + 0.5f * sinf(t * 0.5f));
-    g_hud.armorDur[2] = 0.7f + 0.3f * (0.5f + 0.5f * sinf(t * 0.8f));
-    g_hud.armorDur[3] = 1.0f - 0.4f * (0.5f + 0.5f * sinf(t * 1.1f));
-    g_hud.armorEquipped[0] = g_hud.armorEquipped[1] =
-    g_hud.armorEquipped[2] = g_hud.armorEquipped[3] = true;
-    g_hud.offhandEquipped = true;
-    g_hud.offhandDur = 0.6f + 0.4f * sinf(t * 0.4f);
 }
 
 // ============================================================
-//  ImGui rendering helpers
+//  ImGui HUD rendering
 // ============================================================
-
-static ImVec4 durabilityColor(float t) {
-    // green -> yellow -> red
-    if (t > 0.5f) return ImVec4(1.f - 2.f*(t-0.5f)*1.f, 1.f, 0.f, 1.f);
+static ImVec4 durColor(float t) {
+    if (t > 0.5f) return ImVec4(2.f*(1.f-t), 1.f, 0.f, 1.f);
     return ImVec4(1.f, 2.f*t, 0.f, 1.f);
 }
 
-static void drawHealthBar() {
-    ImGui::SetNextWindowBgAlpha(0.55f);
-    ImGui::SetNextWindowPos(ImVec2(10, ImGui::GetIO().DisplaySize.y - 160), ImGuiCond_Always);
-    ImGui::SetNextWindowSize(ImVec2(200, 50), ImGuiCond_Always);
-    ImGui::Begin("##health", nullptr,
-        ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
-        ImGuiWindowFlags_NoInputs     | ImGuiWindowFlags_NoNav);
+static void drawHUD() {
+    ImGuiIO& io = ImGui::GetIO();
 
-    float pct = (g_hud.maxHealth > 0) ? (g_hud.health / g_hud.maxHealth) : 0.f;
-    ImVec4 col = (pct > 0.5f) ? ImVec4(0.2f,0.9f,0.2f,1.f)
-               : (pct > 0.25f)? ImVec4(0.9f,0.7f,0.1f,1.f)
-               :                 ImVec4(0.9f,0.1f,0.1f,1.f);
-
-    ImGui::TextColored(ImVec4(1,0.3f,0.3f,1), "\u2665 HP");
-    ImGui::SameLine();
-    ImGui::TextColored(col, "%.1f / %.0f", g_hud.health, g_hud.maxHealth);
-
-    ImGui::PushStyleColor(ImGuiCol_PlotHistogram, col);
-    ImGui::ProgressBar(pct, ImVec2(-1, 8), "");
+    // --- Health ---
+    ImGui::SetNextWindowBgAlpha(0.6f);
+    ImGui::SetNextWindowPos({10, io.DisplaySize.y - 160});
+    ImGui::SetNextWindowSize({210, 50});
+    ImGui::Begin("##hp", nullptr, ImGuiWindowFlags_NoDecoration|ImGuiWindowFlags_NoInputs|ImGuiWindowFlags_NoMove);
+    float hpPct = g_hud.maxHealth > 0 ? g_hud.health / g_hud.maxHealth : 0;
+    ImVec4 hcol = hpPct > 0.5f ? ImVec4(.2f,.9f,.2f,1) : hpPct > 0.25f ? ImVec4(.9f,.7f,.1f,1) : ImVec4(.9f,.1f,.1f,1);
+    ImGui::TextColored({1,.3f,.3f,1}, "\u2665 HP"); ImGui::SameLine();
+    ImGui::TextColored(hcol, "%.1f / %.0f", g_hud.health, g_hud.maxHealth);
+    ImGui::PushStyleColor(ImGuiCol_PlotHistogram, hcol);
+    ImGui::ProgressBar(hpPct, {-1,8}, "");
     ImGui::PopStyleColor();
-
     ImGui::End();
-}
 
-static void drawSaturationBar() {
-    ImGui::SetNextWindowBgAlpha(0.55f);
-    ImGui::SetNextWindowPos(ImVec2(10, ImGui::GetIO().DisplaySize.y - 105), ImGuiCond_Always);
-    ImGui::SetNextWindowSize(ImVec2(200, 50), ImGuiCond_Always);
-    ImGui::Begin("##sat", nullptr,
-        ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
-        ImGuiWindowFlags_NoInputs     | ImGuiWindowFlags_NoNav);
-
-    // Hunger (food level /20)
-    float hungerPct = g_hud.foodLevel / 20.f;
-    ImGui::TextColored(ImVec4(0.9f,0.65f,0.2f,1), "\U0001F356 Food");
-    ImGui::SameLine();
+    // --- Food + Saturation ---
+    ImGui::SetNextWindowBgAlpha(0.6f);
+    ImGui::SetNextWindowPos({10, io.DisplaySize.y - 105});
+    ImGui::SetNextWindowSize({210, 55});
+    ImGui::Begin("##food", nullptr, ImGuiWindowFlags_NoDecoration|ImGuiWindowFlags_NoInputs|ImGuiWindowFlags_NoMove);
+    ImGui::TextColored({.9f,.65f,.2f,1}, "\U0001F356 Food"); ImGui::SameLine();
     ImGui::Text("%d/20", g_hud.foodLevel);
-    ImGui::PushStyleColor(ImGuiCol_PlotHistogram, ImVec4(0.8f,0.55f,0.1f,1.f));
-    ImGui::ProgressBar(hungerPct, ImVec2(-1, 6), "");
+    ImGui::PushStyleColor(ImGuiCol_PlotHistogram, ImVec4(.8f,.55f,.1f,1));
+    ImGui::ProgressBar(g_hud.foodLevel/20.f, {-1,6}, "");
     ImGui::PopStyleColor();
-
-    // Saturation (0-20 effectively)
-    float satPct = g_hud.saturation / 20.f;
-    if (satPct > 1.f) satPct = 1.f;
-    ImGui::TextColored(ImVec4(0.9f,0.3f,0.8f,1), "\u2605 Sat");
-    ImGui::SameLine();
+    float satPct = fminf(g_hud.saturation/20.f, 1.f);
+    ImGui::TextColored({.9f,.3f,.8f,1}, "\u2605 Sat"); ImGui::SameLine();
     ImGui::Text("%.1f", g_hud.saturation);
-    ImGui::PushStyleColor(ImGuiCol_PlotHistogram, ImVec4(0.8f,0.2f,0.8f,0.8f));
-    ImGui::ProgressBar(satPct, ImVec2(-1, 6), "");
+    ImGui::PushStyleColor(ImGuiCol_PlotHistogram, ImVec4(.8f,.2f,.8f,.8f));
+    ImGui::ProgressBar(satPct, {-1,6}, "");
     ImGui::PopStyleColor();
-
     ImGui::End();
-}
 
-static void drawArmorHud() {
-    const char* slotLabel[4] = {"Helm", "Chest", "Legs", "Boots"};
-    // Unicode armor icons (fallback text if font lacks them)
-    const char* slotIcon[4]  = {"\U0001F3A9", "\U0001F455", "\U0001F456", "\U0001F45F"};
-
-    ImGui::SetNextWindowBgAlpha(0.55f);
-    ImGui::SetNextWindowPos(ImVec2(ImGui::GetIO().DisplaySize.x - 160, 10), ImGuiCond_Always);
-    ImGui::SetNextWindowSize(ImVec2(150, 130), ImGuiCond_Always);
-    ImGui::Begin("##armor", nullptr,
-        ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
-        ImGuiWindowFlags_NoInputs     | ImGuiWindowFlags_NoNav);
-
-    ImGui::TextColored(ImVec4(0.8f,0.8f,1,1), "  Armor");
-    ImGui::Separator();
-
+    // --- Armor ---
+    const char* slotName[4] = {"Helm","Chest","Legs","Boots"};
+    ImGui::SetNextWindowBgAlpha(0.6f);
+    ImGui::SetNextWindowPos({io.DisplaySize.x - 165, 10});
+    ImGui::SetNextWindowSize({155, 130});
+    ImGui::Begin("##armor", nullptr, ImGuiWindowFlags_NoDecoration|ImGuiWindowFlags_NoInputs|ImGuiWindowFlags_NoMove);
+    ImGui::TextColored({.8f,.8f,1,1}, "  Armor"); ImGui::Separator();
     for (int i = 0; i < 4; i++) {
-        if (!g_hud.armorEquipped[i]) {
-            ImGui::TextDisabled("  %s [empty]", slotLabel[i]);
-            continue;
-        }
-        float dur = g_hud.armorDur[i];
-        ImVec4 col = durabilityColor(dur);
-
-        ImGui::Text(" %s", slotLabel[i]);
-        ImGui::SameLine(60);
-        ImGui::PushStyleColor(ImGuiCol_PlotHistogram, col);
-        char id[16]; snprintf(id, sizeof(id), "##a%d", i);
-        ImGui::ProgressBar(dur, ImVec2(80, 10), id);
+        if (!g_hud.armorEquipped[i]) { ImGui::TextDisabled("  %s [--]", slotName[i]); continue; }
+        ImGui::Text(" %s", slotName[i]); ImGui::SameLine(60);
+        ImGui::PushStyleColor(ImGuiCol_PlotHistogram, durColor(g_hud.armorDur[i]));
+        char id[8]; snprintf(id,8,"##a%d",i);
+        ImGui::ProgressBar(g_hud.armorDur[i], {85,10}, id);
         ImGui::PopStyleColor();
     }
     ImGui::End();
-}
 
-static void drawOffhandHud() {
-    ImGui::SetNextWindowBgAlpha(0.55f);
-    ImGui::SetNextWindowPos(ImVec2(ImGui::GetIO().DisplaySize.x - 160, 148), ImGuiCond_Always);
-    ImGui::SetNextWindowSize(ImVec2(150, 50), ImGuiCond_Always);
-    ImGui::Begin("##offhand", nullptr,
-        ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
-        ImGuiWindowFlags_NoInputs     | ImGuiWindowFlags_NoNav);
-
-    ImGui::TextColored(ImVec4(0.8f,0.8f,1,1), "  Offhand");
-    ImGui::Separator();
-
-    if (!g_hud.offhandEquipped) {
-        ImGui::TextDisabled("  [empty]");
-    } else {
-        float dur = g_hud.offhandDur;
-        ImVec4 col = durabilityColor(dur);
-        ImGui::Text(" Item");
-        ImGui::SameLine(50);
-        ImGui::PushStyleColor(ImGuiCol_PlotHistogram, col);
-        ImGui::ProgressBar(dur, ImVec2(90, 10), "##oh");
+    // --- Offhand ---
+    ImGui::SetNextWindowBgAlpha(0.6f);
+    ImGui::SetNextWindowPos({io.DisplaySize.x - 165, 148});
+    ImGui::SetNextWindowSize({155, 45});
+    ImGui::Begin("##oh", nullptr, ImGuiWindowFlags_NoDecoration|ImGuiWindowFlags_NoInputs|ImGuiWindowFlags_NoMove);
+    ImGui::TextColored({.8f,.8f,1,1}, "  Offhand"); ImGui::Separator();
+    if (!g_hud.offhandEquipped) ImGui::TextDisabled("  [empty]");
+    else {
+        ImGui::Text(" Item"); ImGui::SameLine(50);
+        ImGui::PushStyleColor(ImGuiCol_PlotHistogram, durColor(g_hud.offhandDur));
+        ImGui::ProgressBar(g_hud.offhandDur, {95,10}, "##oh2");
         ImGui::PopStyleColor();
     }
     ImGui::End();
-}
 
-static void drawXpIndicator() {
-    ImGui::SetNextWindowBgAlpha(0.55f);
-    ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_Always);
-    ImGui::SetNextWindowSize(ImVec2(120, 35), ImGuiCond_Always);
-    ImGui::Begin("##xp", nullptr,
-        ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
-        ImGuiWindowFlags_NoInputs     | ImGuiWindowFlags_NoNav);
-
-    ImGui::TextColored(ImVec4(0.3f,1.f,0.3f,1.f), "\u272A XP Lvl: %d", g_hud.xpLevel);
+    // --- XP ---
+    ImGui::SetNextWindowBgAlpha(0.6f);
+    ImGui::SetNextWindowPos({10, 10});
+    ImGui::SetNextWindowSize({130, 30});
+    ImGui::Begin("##xp", nullptr, ImGuiWindowFlags_NoDecoration|ImGuiWindowFlags_NoInputs|ImGuiWindowFlags_NoMove);
+    ImGui::TextColored({.3f,1,.3f,1}, "\u272A XP Lvl: %d", g_hud.xpLevel);
     ImGui::End();
 }
 
 // ============================================================
-//  One-shot ImGui initialisation
+//  ImGui init
 // ============================================================
 static void initImGui(ANativeWindow* window) {
     if (g_hud.imguiInitialized) return;
     g_hud.window = window;
-
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
-    io.DisplaySize = ImVec2(
-        (float)ANativeWindow_getWidth(window),
-        (float)ANativeWindow_getHeight(window)
-    );
-    io.IniFilename = nullptr; // no imgui.ini
-
-    // Dark style with subtle PvP theming
+    io.DisplaySize = {(float)ANativeWindow_getWidth(window), (float)ANativeWindow_getHeight(window)};
+    io.IniFilename = nullptr;
     ImGui::StyleColorsDark();
-    ImGuiStyle& style = ImGui::GetStyle();
-    style.WindowRounding = 6.f;
-    style.FrameRounding  = 4.f;
-    style.WindowBorderSize = 0.f;
-    style.Colors[ImGuiCol_WindowBg] = ImVec4(0.05f, 0.05f, 0.08f, 0.55f);
-
+    ImGuiStyle& s = ImGui::GetStyle();
+    s.WindowRounding = 6.f; s.FrameRounding = 4.f; s.WindowBorderSize = 0.f;
+    s.Colors[ImGuiCol_WindowBg] = {.05f,.05f,.08f,.6f};
     ImGui_ImplAndroid_Init(window);
     ImGui_ImplOpenGL3_Init("#version 300 es");
-
     g_hud.imguiInitialized = true;
-    LOGI("ImGui initialized for PvP HUD");
+    LOGI("ImGui ready");
 }
 
 // ============================================================
-//  eglSwapBuffers hook — our render entry point
+//  eglSwapBuffers hook
 // ============================================================
+using fnEgl = unsigned int(*)(void*,void*);
+static fnEgl orig_eglSwapBuffers = nullptr;
+
 static unsigned int hook_eglSwapBuffers(void* dpy, void* surface) {
-    // Lazy-init: grab window once we have a surface
-    if (!g_hud.imguiInitialized) {
-        // Attempt to find ANativeWindow via EGL
-        // using eglGetNativeWindowType or saved reference from surfaceCreated
-        // For now we rely on JNI surfaceCreated callback below
-    }
-
     if (g_hud.imguiInitialized) {
-        // Update game data
-        refreshMinecraftData();
+        // Scan offsets once after game has loaded
+        static bool scanned = false;
+        if (!scanned) { initOffsets(); scanned = true; }
 
-        // New ImGui frame
+        refreshData();
+
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplAndroid_NewFrame();
         ImGui::NewFrame();
-
-        // Draw all HUD panels
-        drawHealthBar();
-        drawSaturationBar();
-        drawArmorHud();
-        drawOffhandHud();
-        drawXpIndicator();
-
-        // Render
+        drawHUD();
         ImGui::Render();
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
     }
-
     return orig_eglSwapBuffers(dpy, surface);
 }
 
 // ============================================================
-//  Touch input passthrough hook (so ImGui can receive touch)
-// ============================================================
-static bool hook_handleInputEvent(void* self, AInputEvent* event) {
-    if (g_hud.imguiInitialized) {
-        ImGui_ImplAndroid_HandleInputEvent(event);
-    }
-    return orig_handleInputEvent(self, event);
-}
-
-// ============================================================
-//  JNI entry: called when the mod .so is loaded
+//  JNI entry
 // ============================================================
 extern "C" __attribute__((visibility("default")))
 jint JNI_OnLoad(JavaVM* vm, void* reserved) {
-    LOGI("libPvpHud loaded — hooking...");
-
+    LOGI("libPvpHud loading...");
     void* libegl = dlopen("libEGL.so", RTLD_NOW | RTLD_GLOBAL);
-    if (!libegl) {
-        LOGE("Failed to open libEGL.so: %s", dlerror());
-        return JNI_VERSION_1_6;
-    }
-
-    void* eglSwapAddr = dlsym(libegl, "eglSwapBuffers");
-    if (!eglSwapAddr) {
-        LOGE("eglSwapBuffers not found");
-        return JNI_VERSION_1_6;
-    }
-
-    // Hook eglSwapBuffers
-    GlossHook(eglSwapAddr, (void*)hook_eglSwapBuffers, (void**)&orig_eglSwapBuffers);
-    LOGI("Hooked eglSwapBuffers @ %p", eglSwapAddr);
-
-    // Optional: hook input events for touch passthrough
-    // Find the input event dispatcher in libminecraftpe.so
-    // void* mcpe = dlopen("libminecraftpe.so", RTLD_NOW | RTLD_NOLOAD);
-    // void* inputAddr = resolveSymbol(mcpe, "handleInputEvent");
-    // GlossHook(inputAddr, (void*)hook_handleInputEvent, (void**)&orig_handleInputEvent);
-
+    if (!libegl) { LOGE("libEGL.so open failed"); return JNI_VERSION_1_6; }
+    void* addr = dlsym(libegl, "eglSwapBuffers");
+    if (!addr)  { LOGE("eglSwapBuffers not found"); return JNI_VERSION_1_6; }
+    GlossHook(addr, (void*)hook_eglSwapBuffers, (void**)&orig_eglSwapBuffers);
+    LOGI("Hooked eglSwapBuffers");
     return JNI_VERSION_1_6;
 }
 
-// ============================================================
-//  JNI surface callback — called by Java wrapper to pass window
-// ============================================================
 extern "C" __attribute__((visibility("default")))
-void Java_net_yourdomain_pvphud_NativeLib_onSurfaceCreated(
-        JNIEnv* env, jclass cls, jobject surface) {
-    ANativeWindow* window = ANativeWindow_fromSurface(env, surface);
-    if (window) {
-        initImGui(window);
-    }
+void Java_net_pvphud_NativeLib_onSurfaceCreated(JNIEnv* env, jclass, jobject surface) {
+    ANativeWindow* w = ANativeWindow_fromSurface(env, surface);
+    if (w) initImGui(w);
 }
 
 extern "C" __attribute__((visibility("default")))
-void Java_net_yourdomain_pvphud_NativeLib_onSurfaceChanged(
-        JNIEnv* env, jclass cls, jint width, jint height) {
-    if (g_hud.imguiInitialized) {
-        ImGui::GetIO().DisplaySize = ImVec2((float)width, (float)height);
-    }
+void Java_net_pvphud_NativeLib_onSurfaceChanged(JNIEnv* env, jclass, jint w, jint h) {
+    if (g_hud.imguiInitialized)
+        ImGui::GetIO().DisplaySize = {(float)w, (float)h};
 }
