@@ -1,0 +1,40 @@
+name: Build libPvpHud
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup NDK r26b
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r26b
+          add-to-path: true
+
+      - name: Clone Dear ImGui
+        run: git clone --depth=1 https://github.com/ocornut/imgui deps/imgui
+
+      - name: Clone GlossHook
+        run: git clone --depth=1 https://github.com/axhlzy/GlossHook deps/GlossHook
+
+      - name: Build
+        run: |
+          ndk-build \
+            NDK_PROJECT_PATH=. \
+            APP_BUILD_SCRIPT=jni/Android.mk \
+            NDK_APPLICATION_MK=jni/Application.mk \
+            -j$(nproc)
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libPvpHud
+          path: libs/arm64-v8a/libPvpHud.so
