@@ -25,7 +25,7 @@
 #include <cmath>
 
 // --- Third-party headers (included in your project) ---
-#include "GlossHook.h"   // or Dobby: #include "dobby.h"
+#include "GlossHook.h"
 #include "imgui.h"
 #include "imgui_impl_opengl3.h"
 #include "imgui_impl_android.h"
