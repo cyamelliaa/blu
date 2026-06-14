@@ -10,13 +10,45 @@
 #include <cstdint>
 #include <vector>
 #include <sys/mman.h>
+
+static void inlineHook(void* target, void* replacement, void** original) {
+    // Save original bytes and write trampoline
+    static uint8_t trampoline[16];
+    memcpy(trampoline, target, 4);
+    // Write B (branch) instruction to replacement
+    // ARM64 B = 0x14000000 | ((offset >> 2) & 0x3FFFFFF)
+    uintptr_t from = (uintptr_t)target;
+    uintptr_t to   = (uintptr_t)replacement;
+    int64_t   off  = (int64_t)(to - from) >> 2;
+    uint32_t  insn = 0x14000000 | (uint32_t)(off & 0x3FFFFFF);
+    // Make memory writable
+    uintptr_t page = from & ~0xFFF;
+    mprotect((void*)page, 0x1000, PROT_READ | PROT_WRITE | PROT_EXEC);
+    memcpy(target, &insn, 4);
+    mprotect((void*)page, 0x1000, PROT_READ | PROT_EXEC);
+    *original = (void*)orig_eglSwapBuffers; // point to our saved copy
+}
+
+extern "C" __attribute__((visibility("default")))
+jint JNI_OnLoad(JavaVM* vm, void* reserved) {
+    LOGI("libPvpHud loading...");
+    void* libegl = dlopen("libEGL.so", RTLD_NOW | RTLD_GLOBAL);
+    if (!libegl) { LOGE("libEGL.so open failed"); return JNI_VERSION_1_6; }
+    void* addr = dlsym(libegl, "eglSwapBuffers");
+    if (!addr)  { LOGE("eglSwapBuffers not found"); return JNI_VERSION_1_6; }
+    // Save original and hook
+    orig_eglSwapBuffers = (fnEgl)addr;
+    inlineHook(addr, (void*)hook_eglSwapBuffers, (void**)&orig_eglSwapBuffers);
+    LOGI("Hooked eglSwapBuffers");
+    return JNI_VERSION_1_6;
+}
+
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <elf.h>
 #include <link.h>
 
-#include "dobby.h"
 #include "imgui.h"
 #include "imgui_impl_opengl3.h"
 #include "imgui_impl_android.h"
