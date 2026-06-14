@@ -14,7 +14,6 @@
 #include <vector>
 #include <unistd.h>
 
-#include "pl/Hook.h"
 #include "pl/Gloss.h"
 #include "ImGui/imgui.h"
 #include "ImGui/backends/imgui_impl_opengl3.h"
@@ -298,7 +297,7 @@ static void initImGui(ANativeWindow* window) {
 }
 
 // ============================================================
-//  eglSwapBuffers hook via preloader's Gloss
+//  eglSwapBuffers hook
 // ============================================================
 using fnEgl = unsigned int(*)(void*,void*);
 static fnEgl orig_eglSwapBuffers = nullptr;
@@ -318,25 +317,33 @@ static unsigned int hook_eglSwapBuffers(void* dpy, void* surface) {
     return orig_eglSwapBuffers(dpy, surface);
 }
 
-LL_AUTO_STATIC_HOOK(
-    eglSwapBuffersHook,
-    HookPriority::Normal,
-    "eglSwapBuffers",
-    unsigned int,
-    (void* dpy, void* surface)
-) {
-    if (!orig_eglSwapBuffers) orig_eglSwapBuffers = (fnEgl)origin;
-    return hook_eglSwapBuffers(dpy, surface);
+// ============================================================
+//  JNI entry — use preloader's Gloss hook
+// ============================================================
+extern "C" __attribute__((visibility("default")))
+jint JNI_OnLoad(JavaVM* vm, void* reserved) {
+    LOGI("libPvpHud loading...");
+
+    void* libegl = dlopen("libEGL.so", RTLD_NOW | RTLD_GLOBAL);
+    if (!libegl) { LOGE("libEGL.so open failed"); return JNI_VERSION_1_6; }
+
+    void* addr = dlsym(libegl, "eglSwapBuffers");
+    if (!addr) { LOGE("eglSwapBuffers not found"); return JNI_VERSION_1_6; }
+
+    A64HookFunction(addr, (void*)hook_eglSwapBuffers, (void**)&orig_eglSwapBuffers);
+    LOGI("Hooked eglSwapBuffers @ %p", addr);
+
+    return JNI_VERSION_1_6;
 }
 
-LL_AUTO_STATIC_HOOK(
-    surfaceCreatedHook,
-    HookPriority::Normal,
-    "ANativeWindow_fromSurface",
-    ANativeWindow*,
-    (JNIEnv* env, jobject surface)
-) {
-    ANativeWindow* w = origin(env, surface);
+extern "C" __attribute__((visibility("default")))
+void Java_net_pvphud_NativeLib_onSurfaceCreated(JNIEnv* env, jclass, jobject surface) {
+    ANativeWindow* w = ANativeWindow_fromSurface(env, surface);
     if (w) initImGui(w);
-    return w;
+}
+
+extern "C" __attribute__((visibility("default")))
+void Java_net_pvphud_NativeLib_onSurfaceChanged(JNIEnv* env, jclass, jint w, jint h) {
+    if (g_hud.imguiInitialized)
+        ImGui::GetIO().DisplaySize = {(float)w, (float)h};
 }
