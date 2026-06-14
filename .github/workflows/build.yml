@@ -20,19 +20,6 @@ jobs:
       - name: Clone ImGui
         run: git clone --depth=1 https://github.com/ocornut/imgui deps/imgui
 
-      - name: Download prebuilt Dobby
-        run: |
-          mkdir -p deps/dobby/include deps/dobby/lib
-          curl -L https://github.com/jmpews/Dobby/releases/download/v2.1/dobby_android_arm64.zip -o dobby.zip || \
-          wget -q https://github.com/jmpews/Dobby/releases/download/v2.1/dobby_android_arm64.zip -O dobby.zip
-          unzip -o dobby.zip -d deps/dobby/ || true
-          # Also grab the header directly
-          curl -L https://raw.githubusercontent.com/jmpews/Dobby/master/include/dobby.h \
-            -o deps/dobby/include/dobby.h
-
-      - name: Show dobby files
-        run: find deps/dobby -type f
-
       - name: Build mod
         run: |
           ndk-build \
