@@ -21,9 +21,8 @@ jobs:
         run: |
           mkdir -p src/ImGui/backends
           git clone --depth=1 https://github.com/ocornut/imgui src/ImGui_tmp
-          cp src/ImGui_tmp/imgui*.cpp src/ImGui/
-          cp src/ImGui_tmp/imgui*.h src/ImGui/
-          cp src/ImGui_tmp/imconfig.h src/ImGui/
+          cp src/ImGui_tmp/*.cpp src/ImGui/
+          cp src/ImGui_tmp/*.h src/ImGui/
           cp src/ImGui_tmp/backends/imgui_impl_opengl3* src/ImGui/backends/
           cp src/ImGui_tmp/backends/imgui_impl_android* src/ImGui/backends/
 
