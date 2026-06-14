@@ -1,120 +1,55 @@
-# ArmorHUD + AppleSkin — Bedrock Native Mod (LeviLaminar)
+# ArmorHUD + AppleSkin — Bedrock Native Mod
 
-A combined port of **uku's Armor HUD** (Fabric) and **AppleSkin** (Fabric) to
-**Minecraft Bedrock 1.26.0+** as a LeviLaminar native mod (`.so`) + companion
-texture pack (`.mcpack`).
+Port of **uku's Armor HUD** + **AppleSkin** to Minecraft Bedrock 1.26.0+ for [LeviLaminar](https://github.com/...) (Levi Launcher, mobile).
 
----
+## Features
 
-## What's included
+**Armor HUD** (bottom-left)
+- Shows all 4 armor slots with durability % bar
+- Flashing orange warning icon when durability < 10%
 
-| File | Purpose |
-|------|---------|
-| `src/main.cpp` | Native mod source — hooks HUD render, reads armor/food data |
-| `CMakeLists.txt` | Build system (Android NDK, ARM64) |
-| `mcpack/` | Texture pack — original sprites + Bedrock UI JSON |
+**AppleSkin Food HUD** (bottom-right)
+- Golden saturation overlay over hunger icons
+- Brown exhaustion underlay (shows hunger drain progress)
+- Uses the original texture sprites from both mods
 
-### Features
+## Building
 
-**Armor HUD** (from uku's Armor HUD)
-- Shows all 4 equipped armor slots at the bottom-left corner of the HUD
-- Displays durability percentage bar under each piece
-- Shows an orange warning icon (original `warn.png` sprite) when durability < 10%
-- Warning icon bobs/flashes when any piece is critically low
+Push this repo to GitHub. The Actions workflow builds automatically and uploads `ArmorFoodHUD.so` as an artifact.
 
-**AppleSkin / Food HUD** (from AppleSkin)
-- Saturation overlay on the hunger bar (golden tint over hunger icons)
-- Exhaustion underlay (shows how close you are to losing saturation)
-- Food preview: shows how much hunger/saturation would be restored by held food
-- Uses original `appleskin_icons.png` sprite sheet (256×256, same UV offsets)
-
----
-
-## Building the `.so`
-
-### Requirements
-- [Android NDK r26+](https://developer.android.com/ndk/downloads)
-- CMake 3.22+
-- [Gloss](https://github.com/SYsstemXD/Gloss) + [Signature](https://github.com/Suicolen/Signature) (pl library)
-
-### Steps
-
+Or build locally:
 ```bash
-# 1. Clone pl dependencies
-mkdir -p deps/pl
-git clone https://github.com/SYsstemXD/Gloss deps/pl/gloss
-git clone https://github.com/Suicolen/Signature deps/pl/sig
-# Merge headers: copy Gloss.h, Signature.h into deps/pl/include/pl/
-# Merge sources: copy *.cpp into deps/pl/src/
-
-# 2. Configure (replace $NDK with your NDK path)
-cmake \
+cmake -B build \
   -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake \
   -DANDROID_ABI=arm64-v8a \
-  -DANDROID_PLATFORM=android-26 \
-  -DCMAKE_BUILD_TYPE=Release \
-  -B build
-
-# 3. Build
-cmake --build build
-
-# Output: build/ArmorFoodHUD.so
+  -DANDROID_PLATFORM=android-24 \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j$(nproc)
 ```
 
-### GitHub Actions (automatic build)
+## Installing
 
-You can use [MotionBlur's workflow](https://github.com/mrover2503-del/MotionBlur) as a
-template. The key matrix entry:
+1. Copy `ArmorFoodHUD.so` to your LeviLaminar mods folder
+2. Import `armorfoodnud.mcpack` (texture pack companion)
+3. Enable the resource pack in MC Settings → Global Resources
+4. Launch Minecraft
 
-```yaml
-- name: Build ArmorFoodHUD
-  run: |
-    cmake -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK/build/cmake/android.toolchain.cmake \
-          -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-26 \
-          -DCMAKE_BUILD_TYPE=Release -B build
-    cmake --build build
+## Filling in MC offsets
+
+The file `src/main.cpp` has these constants near the top:
+
+```cpp
+static constexpr uintptr_t OFF_GET_ARMOR_DUR  = 0x0;
+static constexpr uintptr_t OFF_GET_FOOD       = 0x0;
+// etc.
 ```
 
----
+Set them to the correct offsets for your MC version by reverse-engineering
+`libminecraftpe.so` (IDA Pro / Ghidra). The HUD renders without them but
+will show static placeholder values until the offsets are filled.
 
-## Installing on LeviLaminar (Levi Launcher)
+## Credits
 
-1. **Copy the `.so`** to your LeviLaminar mods folder:
-   ```
-   /sdcard/games/com.mojang/mods/ArmorFoodHUD.so
-   ```
-   (exact path depends on your Levi Launcher version — check its docs)
-
-2. **Install the texture pack** (`armorfoodnud.mcpack`):
-   - Double-tap to import, or copy to:
-     ```
-     /sdcard/games/com.mojang/resource_packs/armorfoodnud/
-     ```
-   - Enable it in Minecraft → Settings → Global Resources
-
-3. Launch Minecraft. Both features activate automatically.
-
----
-
-## Signature notes
-
-The signatures in `main.cpp` are **wildcard patterns** (using `?` bytes) so
-they work across minor Bedrock updates. If MC gets a major update and sigs
-break:
-
-1. Open `libminecraftpe.so` in IDA Pro / Ghidra
-2. Find `LocalPlayer::getArmorValue`, `Player::getFoodLevel`, etc.
-3. Update the corresponding `SIG_*` constants in `src/main.cpp`
-
-The `PatchMemory()` utility and the `pl::signature::pl_resolve_signature()`
-approach is the same pattern used by [BetterBrightness](https://github.com/...) 
-and MotionBlur.
-
----
-
-## Texture credits
-
-- `appleskin_icons.png`, `tooltip_hunger_outline.png` — © squeek502 (Unlicense)
-- `armor_warn.png` — © BerdinskiyBear / uku (MIT)
-
-Both original mods are open-source. This port is provided under the same licenses.
+- uku's Armor HUD — BerdinskiyBear / uku (MIT)
+- AppleSkin — squeek502 (Unlicense)
+- Build pattern — mrover2503-del/MotionBlur
