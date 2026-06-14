@@ -1,82 +1,66 @@
-cmake_minimum_required(VERSION 3.18)
-project(PvpHud LANGUAGES C CXX)
+cmake_minimum_required(VERSION 3.22)
+project(ArmorFoodHUD VERSION 1.0.0 LANGUAGES CXX)
 
-set(ANDROID_STL c++_shared)
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O2 -fvisibility=hidden -ffunction-sections -fdata-sections -fexceptions -w")
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O2 -fvisibility=hidden -ffunction-sections -fdata-sections -w")
-set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,--gc-sections,--strip-all -s")
 
-cmake_policy(SET CMP0169 OLD)
-cmake_policy(SET CMP0135 NEW)
+# ── Target: Android ARM64-v8a ────────────────────────────────────────────────
+# Build with Android NDK r26+ targeting API 26 (Android 8.0+, covers Minecraft Bedrock mobile)
+# cmake -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake \
+#       -DANDROID_ABI=arm64-v8a \
+#       -DANDROID_PLATFORM=android-26 \
+#       -DCMAKE_BUILD_TYPE=Release \
+#       -B build && cmake --build build
 
-include(FetchContent)
+# ── Locate pl (Gloss + Signature) ────────────────────────────────────────────
+# Clone https://github.com/SYsstemXD/Gloss and https://github.com/Suicolen/Signature
+# into deps/pl/ before building.
+# Expected layout:
+#   deps/pl/include/pl/Gloss.h
+#   deps/pl/include/pl/Signature.h
+#   deps/pl/src/Gloss.cpp
+#   deps/pl/src/Signature.cpp
 
-FetchContent_Declare(
-    fmt
-    GIT_REPOSITORY https://github.com/fmtlib/fmt.git
-    GIT_TAG 10.2.1
-    GIT_SHALLOW ON
+add_library(pl STATIC
+    deps/pl/src/Gloss.cpp
+    deps/pl/src/Signature.cpp
 )
-FetchContent_MakeAvailable(fmt)
+target_include_directories(pl PUBLIC deps/pl/include)
+target_compile_options(pl PRIVATE -O2 -fPIC)
 
-FetchContent_Declare(
-    nlohmann_json
-    GIT_REPOSITORY https://github.com/nlohmann/json.git
-    GIT_TAG v3.11.2
-    GIT_SHALLOW ON
-)
-FetchContent_MakeAvailable(nlohmann_json)
-
-FetchContent_Declare(
-    preloader_android
-    GIT_REPOSITORY https://github.com/LiteLDev/preloader-android.git
-    GIT_TAG 0.1.14
-    GIT_SHALLOW ON
-)
-FetchContent_GetProperties(preloader_android)
-if(NOT preloader_android_POPULATED)
-    FetchContent_Populate(preloader_android)
-    file(READ "${preloader_android_SOURCE_DIR}/src/pl/Logger.h" LOGGER_CONTENT)
-    string(REPLACE "#include <format>" "#include <fmt/format.h>" LOGGER_CONTENT "${LOGGER_CONTENT}")
-    string(REPLACE "std::vformat" "fmt::vformat" LOGGER_CONTENT "${LOGGER_CONTENT}")
-    string(REPLACE "std::make_format_args" "fmt::make_format_args" LOGGER_CONTENT "${LOGGER_CONTENT}")
-    file(WRITE "${preloader_android_SOURCE_DIR}/src/pl/Logger.h" "${LOGGER_CONTENT}")
-    add_subdirectory(${preloader_android_SOURCE_DIR} ${preloader_android_BINARY_DIR})
-endif()
-target_link_libraries(preloader PUBLIC fmt::fmt nlohmann_json::nlohmann_json)
-
-target_include_directories(preloader PUBLIC
-    ${CMAKE_SOURCE_DIR}/src
-    ${CMAKE_SOURCE_DIR}/src/ImGui
-    ${CMAKE_SOURCE_DIR}/src/ImGui/backends
-)
-
-set(SOURCES
+# ── Main mod library ──────────────────────────────────────────────────────────
+add_library(ArmorFoodHUD SHARED
     src/main.cpp
-    src/ImGui/imgui.cpp
-    src/ImGui/imgui_draw.cpp
-    src/ImGui/imgui_tables.cpp
-    src/ImGui/imgui_widgets.cpp
-    src/ImGui/backends/imgui_impl_opengl3.cpp
-    src/ImGui/backends/imgui_impl_android.cpp
 )
 
-add_library(PvpHud SHARED ${SOURCES})
+target_include_directories(ArmorFoodHUD PRIVATE
+    deps/pl/include
+)
 
-target_link_libraries(PvpHud
-    preloader
-    fmt::fmt
-    log
+target_link_libraries(ArmorFoodHUD PRIVATE
+    pl
     android
-    EGL
-    GLESv3
-    GLESv2
+    log
 )
 
-set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/output)
-set_target_properties(PvpHud PROPERTIES
-    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/output
-    LIBRARY_OUTPUT_NAME PvpHud
+target_compile_options(ArmorFoodHUD PRIVATE
+    -O2
+    -fPIC
+    -fvisibility=hidden
+    -fno-rtti
+    -Wno-unused-result
 )
+
+# Strip debug symbols in release
+if(CMAKE_BUILD_TYPE STREQUAL "Release")
+    target_link_options(ArmorFoodHUD PRIVATE -s)
+endif()
+
+set_target_properties(ArmorFoodHUD PROPERTIES
+    OUTPUT_NAME "ArmorFoodHUD"
+    PREFIX      ""
+    SUFFIX      ".so"
+)
+
+message(STATUS "ArmorFoodHUD: targeting Android ARM64 API 26")
+message(STATUS "Output: libArmorFoodHUD.so  (rename to ArmorFoodHUD.so for LeviLaminar)")
