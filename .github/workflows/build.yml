@@ -1,6 +1,38 @@
-name: Build ArmorFoodHUD
+name: Build libPvpHud
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: nttld/setup-ndk@v1
+        id: ndk
+        with:
+          ndk-version: r26b
+
+      - name: Clone ImGui into src/ImGui
+        run: |
+          mkdir -p src/ImGui/backends
+          git clone --depth=1 https://github.com/ocornut/imgui src/ImGui_tmp
+          cp src/ImGui_tmp/*.cpp src/ImGui/
+          cp src/ImGui_tmp/*.h src/ImGui/
+          cp src/ImGui_tmp/backends/imgui_impl_opengl3* src/ImGui/backends/
+          cp src/ImGui_tmp/backends/imgui_impl_android* src/ImGui/backends/
+      - name: Build ArmorFoodHUD
   run: |
     cmake -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK/build/cmake/android.toolchain.cmake \
           -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-26 \
           -DCMAKE_BUILD_TYPE=Release -B build
     cmake --build build
+    
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libPvpHud
+          path: build/output/libPvpHud.so
