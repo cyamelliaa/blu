@@ -21,6 +21,22 @@ FetchContent_Declare(dobby
 )
 FetchContent_MakeAvailable(dobby)
 
+# patch: dobby's arm64 closure bridge asm uses macOS-only @PAGE/@PAGEOFF
+# relocations, which clang's integrated assembler rejects for ELF
+# (android) targets. make it conditional on __APPLE__, use ELF :lo12:
+# syntax otherwise.
+set(_dobby_arm64_asm "${dobby_SOURCE_DIR}/source/TrampolineBridge/ClosureTrampolineBridge/arm64/closure_bridge_arm64.asm")
+file(READ "${_dobby_arm64_asm}" _asm)
+string(REPLACE
+    "adrp TMP_REG_0, cdecl(common_closure_bridge_handler)@PAGE"
+    "#if defined(__APPLE__)\nadrp TMP_REG_0, cdecl(common_closure_bridge_handler)@PAGE\n#else\nadrp TMP_REG_0, cdecl(common_closure_bridge_handler)\n#endif"
+    _asm "${_asm}")
+string(REPLACE
+    "add TMP_REG_0, TMP_REG_0, cdecl(common_closure_bridge_handler)@PAGEOFF"
+    "#if defined(__APPLE__)\nadd TMP_REG_0, TMP_REG_0, cdecl(common_closure_bridge_handler)@PAGEOFF\n#else\nadd TMP_REG_0, TMP_REG_0, :lo12:cdecl(common_closure_bridge_handler)\n#endif"
+    _asm "${_asm}")
+file(WRITE "${_dobby_arm64_asm}" "${_asm}")
+
 # ── Dear ImGui ────────────────────────────────────────────────────────────────
 FetchContent_Declare(imgui
     GIT_REPOSITORY https://github.com/ocornut/imgui.git
