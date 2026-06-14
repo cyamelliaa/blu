@@ -26,12 +26,15 @@ jobs:
           cp src/ImGui_tmp/backends/imgui_impl_opengl3* src/ImGui/backends/
           cp src/ImGui_tmp/backends/imgui_impl_android* src/ImGui/backends/
 
-      name: Build ArmorFoodHUD
-  run: |
-    cmake -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK/build/cmake/android.toolchain.cmake \
-          -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-26 \
-          -DCMAKE_BUILD_TYPE=Release -B build
-    cmake --build build -j$(nproc)
+      - name: Build
+        run: |
+          mkdir build
+          cmake -B build \
+            -DCMAKE_TOOLCHAIN_FILE=${{ steps.ndk.outputs.ndk-path }}/build/cmake/android.toolchain.cmake \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-24 \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j$(nproc)
 
       - uses: actions/upload-artifact@v4
         with:
