@@ -1,39 +1,37 @@
-cmake_minimum_required(VERSION 3.18)
-project(ArmorFoodHUDProject LANGUAGES C CXX)
+name: Build ArmorFoodHUD
 
-set(CMAKE_CXX_STANDARD 20)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
 
-set(CMAKE_CXX_FLAGS  "${CMAKE_CXX_FLAGS}  -O2 -fvisibility=hidden -ffunction-sections -fdata-sections -fexceptions -w")
-set(CMAKE_C_FLAGS    "${CMAKE_C_FLAGS}    -O2 -fvisibility=hidden -ffunction-sections -fdata-sections -w")
-set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,--gc-sections,--strip-all -s")
+jobs:
+  build:
+    runs-on: ubuntu-latest
 
-include(FetchContent)
-set(FETCHCONTENT_QUIET OFF)
+    steps:
+      - uses: actions/checkout@v4
 
-# ── Dobby ─────────────────────────────────────────────────────────────────────
-set(DOBBY_BUILD_SHARED OFF CACHE BOOL "" FORCE)
-set(DOBBY_DEBUG        OFF CACHE BOOL "" FORCE)
-FetchContent_Declare(dobby
-    GIT_REPOSITORY https://github.com/jmpews/Dobby.git
-    GIT_TAG        master
-    GIT_SHALLOW    TRUE
-)
-FetchContent_MakeAvailable(dobby)
+      - uses: nttld/setup-ndk@v1
+        id: ndk
+        with:
+          ndk-version: r25c
 
-# ── Dear ImGui ────────────────────────────────────────────────────────────────
-FetchContent_Declare(imgui
-    GIT_REPOSITORY https://github.com/ocornut/imgui.git
-    GIT_TAG        v1.90.5
-    GIT_SHALLOW    TRUE
-)
-FetchContent_MakeAvailable(imgui)
+      - name: Build
+        run: |
+          mkdir build
+          cmake -B build \
+            -DCMAKE_TOOLCHAIN_FILE=${{ steps.ndk.outputs.ndk-path }}/build/cmake/android.toolchain.cmake \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-24 \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j$(nproc)
 
-# ── stb ───────────────────────────────────────────────────────────────────────
-FetchContent_Declare(stb
-    GIT_REPOSITORY https://github.com/nothings/stb.git
-    GIT_TAG        master
-    GIT_SHALLOW    TRUE
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ArmorFoodHUD
+          path: build/ArmorFoodHUD.so
 )
 FetchContent_MakeAvailable(stb)
 
