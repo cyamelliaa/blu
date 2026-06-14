@@ -1,9 +1,3 @@
-/**
- * libPvpHud.so
- * Minecraft Bedrock Native PvP HUD Mod
- * Uses pattern scanning for automatic offset resolution across MCBE versions.
- */
-
 #include <jni.h>
 #include <dlfcn.h>
 #include <android/log.h>
@@ -22,7 +16,7 @@
 #include <elf.h>
 #include <link.h>
 
-#include "GlossHook.h"
+#include "dobby.h"
 #include "imgui.h"
 #include "imgui_impl_opengl3.h"
 #include "imgui_impl_android.h"
@@ -318,7 +312,7 @@ jint JNI_OnLoad(JavaVM* vm, void* reserved) {
     if (!libegl) { LOGE("libEGL.so open failed"); return JNI_VERSION_1_6; }
     void* addr = dlsym(libegl, "eglSwapBuffers");
     if (!addr)  { LOGE("eglSwapBuffers not found"); return JNI_VERSION_1_6; }
-    GlossHook(addr, (void*)hook_eglSwapBuffers, (void**)&orig_eglSwapBuffers);
+    DobbyHook(addr, (void*)hook_eglSwapBuffers, (void**)&orig_eglSwapBuffers);
     LOGI("Hooked eglSwapBuffers");
     return JNI_VERSION_1_6;
 }
