@@ -1,66 +1,51 @@
-cmake_minimum_required(VERSION 3.22)
-project(ArmorFoodHUD VERSION 1.0.0 LANGUAGES CXX)
+cmake_minimum_required(VERSION 3.18)
+project(ArmorFoodHUD LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# ── Target: Android ARM64-v8a ────────────────────────────────────────────────
-# Build with Android NDK r26+ targeting API 26 (Android 8.0+, covers Minecraft Bedrock mobile)
-# cmake -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake \
-#       -DANDROID_ABI=arm64-v8a \
-#       -DANDROID_PLATFORM=android-26 \
-#       -DCMAKE_BUILD_TYPE=Release \
-#       -B build && cmake --build build
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O2 -fvisibility=hidden -ffunction-sections -fdata-sections -fexceptions -w")
+set(CMAKE_C_FLAGS   "${CMAKE_C_FLAGS}   -O2 -fvisibility=hidden -ffunction-sections -fdata-sections -w")
+set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,--gc-sections,--strip-all -s")
 
-# ── Locate pl (Gloss + Signature) ────────────────────────────────────────────
-# Clone https://github.com/SYsstemXD/Gloss and https://github.com/Suicolen/Signature
-# into deps/pl/ before building.
-# Expected layout:
-#   deps/pl/include/pl/Gloss.h
-#   deps/pl/include/pl/Signature.h
-#   deps/pl/src/Gloss.cpp
-#   deps/pl/src/Signature.cpp
+include(FetchContent)
 
-add_library(pl STATIC
-    deps/pl/src/Gloss.cpp
-    deps/pl/src/Signature.cpp
+# Dobby — inline hooking library (same as MotionBlur)
+FetchContent_Declare(
+    dobby
+    GIT_REPOSITORY https://github.com/jmpews/Dobby.git
+    GIT_TAG        master
 )
-target_include_directories(pl PUBLIC deps/pl/include)
-target_compile_options(pl PRIVATE -O2 -fPIC)
+FetchContent_MakeAvailable(dobby)
 
-# ── Main mod library ──────────────────────────────────────────────────────────
-add_library(ArmorFoodHUD SHARED
+include_directories(
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/src/ImGui
+    ${CMAKE_SOURCE_DIR}/src/ImGui/backends
+)
+
+set(SOURCES
     src/main.cpp
+    src/ImGui/imgui.cpp
+    src/ImGui/imgui_draw.cpp
+    src/ImGui/imgui_tables.cpp
+    src/ImGui/imgui_widgets.cpp
+    src/ImGui/backends/imgui_impl_opengl3.cpp
+    src/ImGui/backends/imgui_impl_android.cpp
 )
 
-target_include_directories(ArmorFoodHUD PRIVATE
-    deps/pl/include
-)
+add_library(ArmorFoodHUD SHARED ${SOURCES})
 
-target_link_libraries(ArmorFoodHUD PRIVATE
-    pl
-    android
+target_link_libraries(ArmorFoodHUD
+    dobby
     log
+    android
+    EGL
+    GLESv3
+    GLESv2
 )
-
-target_compile_options(ArmorFoodHUD PRIVATE
-    -O2
-    -fPIC
-    -fvisibility=hidden
-    -fno-rtti
-    -Wno-unused-result
-)
-
-# Strip debug symbols in release
-if(CMAKE_BUILD_TYPE STREQUAL "Release")
-    target_link_options(ArmorFoodHUD PRIVATE -s)
-endif()
 
 set_target_properties(ArmorFoodHUD PROPERTIES
     OUTPUT_NAME "ArmorFoodHUD"
-    PREFIX      ""
-    SUFFIX      ".so"
+    PREFIX ""
 )
-
-message(STATUS "ArmorFoodHUD: targeting Android ARM64 API 26")
-message(STATUS "Output: libArmorFoodHUD.so  (rename to ArmorFoodHUD.so for LeviLaminar)")
