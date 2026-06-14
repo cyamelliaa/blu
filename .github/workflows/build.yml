@@ -23,10 +23,11 @@ jobs:
         run: git clone --depth=1 https://github.com/ocornut/imgui deps/imgui
 
       - name: Clone GlossHook
-        run: |
-          git clone --depth=1 https://github.com/XMDS/GlossHook deps/GlossHook
-          find deps/GlossHook -name "*.h" | head -20
-          
+        run: git clone --depth=1 https://github.com/XMDS/GlossHook deps/GlossHook
+
+      - name: Show GlossHook files
+        run: find deps/GlossHook -type f | sort
+
       - name: Build
         run: |
           ndk-build \
