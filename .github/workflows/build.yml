@@ -10,25 +10,31 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup NDK r26b
-        uses: nttld/setup-ndk@v1
+      - uses: nttld/setup-ndk@v1
         with:
           ndk-version: r26b
           add-to-path: true
 
-      - name: Clone Dear ImGui
+      - name: Clone ImGui
         run: git clone --depth=1 https://github.com/ocornut/imgui deps/imgui
 
-      - name: Clone GlossHook
-        run: git clone --depth=1 https://github.com/XMDS/GlossHook deps/GlossHook
+      - name: Clone Dobby
+        run: git clone --depth=1 https://github.com/jmpews/Dobby deps/Dobby
 
-      - name: Show GlossHook files
-        run: find deps/GlossHook -type f | sort
+      - name: Build Dobby
+        run: |
+          cd deps/Dobby
+          cmake . -B build \
+            -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-29 \
+            -DPlugin.SymbolResolver=OFF \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j$(nproc)
 
-      - name: Build
+      - name: Build mod
         run: |
           ndk-build \
             NDK_PROJECT_PATH=. \
@@ -36,7 +42,7 @@ jobs:
             NDK_APPLICATION_MK=jni/Application.mk \
             -j$(nproc)
 
-      - name: Upload artifact
+      - name: Upload
         uses: actions/upload-artifact@v4
         with:
           name: libPvpHud
