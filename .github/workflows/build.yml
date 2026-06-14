@@ -1,4 +1,4 @@
-name: Build libPvpHud
+name: Build libArmorHud
 
 on:
   push:
