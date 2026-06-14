@@ -1,156 +1,120 @@
-# libPvpHud — Minecraft Bedrock Native PvP HUD Mod
+# ArmorHUD + AppleSkin — Bedrock Native Mod (LeviLaminar)
 
-A native Android `.so` mod for Minecraft Bedrock Edition that adds a PvP-focused HUD overlay using Dear ImGui, built on the same architecture as `libNoDisconnect` (GlossHook + ImGui over eglSwapBuffers).
-
-## Features
-
-| Panel | Info shown |
-|-------|-----------|
-| **Health** | Current HP / Max HP, color-coded bar |
-| **Food + Saturation** | Hunger bar + hidden saturation bar (big PvP factor) |
-| **Armor HUD** | All 4 slots with color-coded durability bars |
-| **Offhand** | Item name + durability bar |
-| **XP Level** | Current level number |
+A combined port of **uku's Armor HUD** (Fabric) and **AppleSkin** (Fabric) to
+**Minecraft Bedrock 1.26.0+** as a LeviLaminar native mod (`.so`) + companion
+texture pack (`.mcpack`).
 
 ---
 
-## Project structure
+## What's included
 
-```
-pvp_hud/
-├── src/
-│   └── main.cpp          ← All mod code
-├── include/
-│   └── mcbe_sdk.h        ← MCBE vtable/symbol helpers (UPDATE OFFSETS!)
-├── jni/
-│   ├── Android.mk        ← ndk-build script
-│   └── Application.mk
-└── deps/                 ← you provide these (see below)
-    ├── imgui/
-    ├── GlossHook/        (or Dobby)
-    └── (no MCBE SDK needed — resolved at runtime via dlsym)
-```
+| File | Purpose |
+|------|---------|
+| `src/main.cpp` | Native mod source — hooks HUD render, reads armor/food data |
+| `CMakeLists.txt` | Build system (Android NDK, ARM64) |
+| `mcpack/` | Texture pack — original sprites + Bedrock UI JSON |
 
----
+### Features
 
-## Prerequisites
+**Armor HUD** (from uku's Armor HUD)
+- Shows all 4 equipped armor slots at the bottom-left corner of the HUD
+- Displays durability percentage bar under each piece
+- Shows an orange warning icon (original `warn.png` sprite) when durability < 10%
+- Warning icon bobs/flashes when any piece is critically low
 
-### NDK
-```bash
-# Download NDK r26b (same version used to build libNoDisconnect)
-# https://developer.android.com/ndk/downloads
-export NDK=/path/to/android-ndk-r26b
-```
-
-### Dear ImGui
-```bash
-git clone https://github.com/ocornut/imgui deps/imgui
-# Make sure you have:
-#   deps/imgui/backends/imgui_impl_android.cpp
-#   deps/imgui/backends/imgui_impl_opengl3.cpp
-```
-
-### GlossHook  *(same hooking lib used in libNoDisconnect)*
-```bash
-# Binary release or build from source:
-# https://github.com/axhlzy/GlossHook
-# Place .h in deps/GlossHook/include/
-# Place libGlossHook.a in deps/GlossHook/libs/arm64-v8a/
-```
-
-Alternative: replace GlossHook calls with **Dobby**:
-```cpp
-// In main.cpp replace:
-GlossHook(addr, hookFn, &origFn);
-// With:
-DobbyHook(addr, hookFn, &origFn);
-```
+**AppleSkin / Food HUD** (from AppleSkin)
+- Saturation overlay on the hunger bar (golden tint over hunger icons)
+- Exhaustion underlay (shows how close you are to losing saturation)
+- Food preview: shows how much hunger/saturation would be restored by held food
+- Uses original `appleskin_icons.png` sprite sheet (256×256, same UV offsets)
 
 ---
 
-## Build
+## Building the `.so`
+
+### Requirements
+- [Android NDK r26+](https://developer.android.com/ndk/downloads)
+- CMake 3.22+
+- [Gloss](https://github.com/SYsstemXD/Gloss) + [Signature](https://github.com/Suicolen/Signature) (pl library)
+
+### Steps
 
 ```bash
-cd pvp_hud
-$NDK/ndk-build NDK_PROJECT_PATH=. APP_BUILD_SCRIPT=jni/Android.mk -j$(nproc)
-# Output: libs/arm64-v8a/libPvpHud.so
+# 1. Clone pl dependencies
+mkdir -p deps/pl
+git clone https://github.com/SYsstemXD/Gloss deps/pl/gloss
+git clone https://github.com/Suicolen/Signature deps/pl/sig
+# Merge headers: copy Gloss.h, Signature.h into deps/pl/include/pl/
+# Merge sources: copy *.cpp into deps/pl/src/
+
+# 2. Configure (replace $NDK with your NDK path)
+cmake \
+  -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake \
+  -DANDROID_ABI=arm64-v8a \
+  -DANDROID_PLATFORM=android-26 \
+  -DCMAKE_BUILD_TYPE=Release \
+  -B build
+
+# 3. Build
+cmake --build build
+
+# Output: build/ArmorFoodHUD.so
+```
+
+### GitHub Actions (automatic build)
+
+You can use [MotionBlur's workflow](https://github.com/mrover2503-del/MotionBlur) as a
+template. The key matrix entry:
+
+```yaml
+- name: Build ArmorFoodHUD
+  run: |
+    cmake -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK/build/cmake/android.toolchain.cmake \
+          -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-26 \
+          -DCMAKE_BUILD_TYPE=Release -B build
+    cmake --build build
 ```
 
 ---
 
-## Updating Minecraft offsets
+## Installing on LeviLaminar (Levi Launcher)
 
-The symbols in `include/mcbe_sdk.h` are **mangled C++ names** that change between MCBE versions.
+1. **Copy the `.so`** to your LeviLaminar mods folder:
+   ```
+   /sdcard/games/com.mojang/mods/ArmorFoodHUD.so
+   ```
+   (exact path depends on your Levi Launcher version — check its docs)
 
-### Method 1: bedrock-headers (recommended)
-```
-https://github.com/mcbedrock/bedrock-headers
-```
-Find the method you want, look up its mangled name, put it in `mcbe_sdk.h`.
+2. **Install the texture pack** (`armorfoodnud.mcpack`):
+   - Double-tap to import, or copy to:
+     ```
+     /sdcard/games/com.mojang/resource_packs/armorfoodnud/
+     ```
+   - Enable it in Minecraft → Settings → Global Resources
 
-### Method 2: Ghidra / IDA
-1. Open `libminecraftpe.so` in Ghidra
-2. Search for the function (e.g. `getHealth`)
-3. Copy the mangled symbol name
-4. Paste into `resolveSymbol(...)` calls in `mcbe_sdk.h`
-
-### Method 3: offset scanning at runtime
-If symbols are stripped, scan for byte patterns:
-```cpp
-// Example: scan for a known byte sequence
-uint8_t pattern[] = {0x08, 0x28, 0x40, 0xF9, ...};
-uintptr_t addr = scanMemory("libminecraftpe.so", pattern, sizeof(pattern));
-```
+3. Launch Minecraft. Both features activate automatically.
 
 ---
 
-## Integration with ModMenu / loader
+## Signature notes
 
-If you're using a mod loader (e.g. the one that loaded `libNoDisconnect`), just drop `libPvpHud.so` in the same mods folder.
+The signatures in `main.cpp` are **wildcard patterns** (using `?` bytes) so
+they work across minor Bedrock updates. If MC gets a major update and sigs
+break:
 
-For standalone injection via `addongen` / custom launcher:
-1. Package the `.so` into the APK or side-load it
-2. Call `System.loadLibrary("PvpHud")` from Java, or use `dlopen` from another `.so`
-3. Forward `Surface.surfaceCreated()` to `NativeLib.onSurfaceCreated()` so ImGui gets the window
+1. Open `libminecraftpe.so` in IDA Pro / Ghidra
+2. Find `LocalPlayer::getArmorValue`, `Player::getFoodLevel`, etc.
+3. Update the corresponding `SIG_*` constants in `src/main.cpp`
 
-```java
-// In your Java bridge (optional if using eglSwapBuffers hook alone)
-public class NativeLib {
-    static { System.loadLibrary("PvpHud"); }
-    public static native void onSurfaceCreated(Surface s);
-    public static native void onSurfaceChanged(int w, int h);
-}
-```
+The `PatchMemory()` utility and the `pl::signature::pl_resolve_signature()`
+approach is the same pattern used by [BetterBrightness](https://github.com/...) 
+and MotionBlur.
 
 ---
 
-## HUD layout (default)
+## Texture credits
 
-```
-[XP Lvl: 5]           [Helm  ████████░░]
-                       [Chest ██████████]
-                       [Legs  ███████░░░]
-                       [Boots ████░░░░░░]
-                       [Off   ██████░░░░]
+- `appleskin_icons.png`, `tooltip_hunger_outline.png` — © squeek502 (Unlicense)
+- `armor_warn.png` — © BerdinskiyBear / uku (MIT)
 
-[♥ HP  18.0 / 20  ███████████░]
-[🍖 Food 20/20   ████████████]
-[★ Sat 4.2       █████░░░░░░░]
-```
-
----
-
-## Common issues
-
-| Problem | Fix |
-|---------|-----|
-| HUD not appearing | Check `initImGui` is called; verify `eglSwapBuffers` hook succeeded (check logcat) |
-| All zeros / wrong values | Symbol names need updating for your MCBE version — use Ghidra |
-| Crash on load | GlossHook version mismatch; try Dobby instead |
-| ImGui crashes | Ensure OpenGL ES 3.0 context exists before `ImGui_ImplOpenGL3_Init` |
-| Touch not working | Wire up `hook_handleInputEvent` to your input dispatcher |
-
----
-
-## License
-Do whatever you want. Credit appreciated.
+Both original mods are open-source. This port is provided under the same licenses.
