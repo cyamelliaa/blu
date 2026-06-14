@@ -1,42 +1,33 @@
-name: Build libPvpHud
+name: Build
 
 on:
   push:
-    branches: [ main ]
+    branches: [main, master]
+  pull_request:
   workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
-
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: nttld/setup-ndk@v1
-        id: ndk
-        with:
-          ndk-version: r26b
-
-      - name: Clone ImGui into src/ImGui
-        run: |
-          mkdir -p src/ImGui/backends
-          git clone --depth=1 https://github.com/ocornut/imgui src/ImGui_tmp
-          cp src/ImGui_tmp/*.cpp src/ImGui/
-          cp src/ImGui_tmp/*.h src/ImGui/
-          cp src/ImGui_tmp/backends/imgui_impl_opengl3* src/ImGui/backends/
-          cp src/ImGui_tmp/backends/imgui_impl_android* src/ImGui/backends/
-
-      - name: Build
-        run: |
-          mkdir build
-          cmake -B build \
-            -DCMAKE_TOOLCHAIN_FILE=${{ steps.ndk.outputs.ndk-path }}/build/cmake/android.toolchain.cmake \
-            -DANDROID_ABI=arm64-v8a \
-            -DANDROID_PLATFORM=android-24 \
-            -DCMAKE_BUILD_TYPE=Release
-          cmake --build build -j$(nproc)
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: libPvpHud
-          path: build/output/libPvpHud.so
+    - uses: actions/checkout@v4
+    
+    - uses: nttld/setup-ndk@v1
+      id: ndk
+      with:
+        ndk-version: r26b
+        
+    - name: Build
+      run: |
+        mkdir build
+        cmake -B build \
+          -DCMAKE_TOOLCHAIN_FILE=${{ steps.ndk.outputs.ndk-path }}/build/cmake/android.toolchain.cmake \
+          -DANDROID_ABI=arm64-v8a \
+          -DANDROID_PLATFORM=android-24 \
+          -DCMAKE_BUILD_TYPE=Release
+        cmake --build build -j$(nproc)
+        
+    - uses: actions/upload-artifact@v4
+      with:
+        name: libBetterBrightness
+        path: build/libBetterBrightness.so
