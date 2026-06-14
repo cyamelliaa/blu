@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.18)
-project(ArmorFoodHUDProject LANGUAGES C CXX)
+project(AFHudProject LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -249,7 +249,7 @@ include_directories(
 )
 
 # ── Library ───────────────────────────────────────────────────────────────────
-add_library(ArmorFoodHUD SHARED
+add_library(AFHUD SHARED
     src/main.cpp
     ${imgui_SOURCE_DIR}/imgui.cpp
     ${imgui_SOURCE_DIR}/imgui_draw.cpp
@@ -259,14 +259,14 @@ add_library(ArmorFoodHUD SHARED
     ${imgui_SOURCE_DIR}/backends/imgui_impl_android.cpp
 )
 
-target_link_libraries(ArmorFoodHUD PRIVATE
+target_link_libraries(AFHUD PRIVATE
     dobby log android EGL GLESv3 GLESv2
 )
 
 set_target_properties(ArmorFoodHUD PROPERTIES OUTPUT_NAME "ArmorFoodHUD" PREFIX "")
-add_library(ArmorFoodHUD SHARED ${SOURCES})
+add_library(AFHUD SHARED ${SOURCES})
 
-target_link_libraries(ArmorFoodHUD
+target_link_libraries(AFHUD
     dobby
     log
     android
@@ -275,7 +275,7 @@ target_link_libraries(ArmorFoodHUD
     GLESv2
 )
 
-set_target_properties(ArmorFoodHUD PROPERTIES
-    OUTPUT_NAME "ArmorFoodHUD"
+set_target_properties(AFHUD PROPERTIES
+    OUTPUT_NAME "AFHud"
     PREFIX ""
 )
