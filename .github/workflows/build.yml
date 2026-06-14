@@ -13,23 +13,31 @@ jobs:
       - uses: actions/checkout@v4
 
       - uses: nttld/setup-ndk@v1
+        id: ndk
         with:
           ndk-version: r26b
-          add-to-path: true
 
-      - name: Clone ImGui
-        run: git clone --depth=1 https://github.com/ocornut/imgui deps/imgui
-
-      - name: Build mod
+      - name: Clone ImGui into src/ImGui
         run: |
-          ndk-build \
-            NDK_PROJECT_PATH=. \
-            APP_BUILD_SCRIPT=jni/Android.mk \
-            NDK_APPLICATION_MK=jni/Application.mk \
-            -j$(nproc)
+          mkdir -p src/ImGui
+          git clone --depth=1 https://github.com/ocornut/imgui src/ImGui_tmp
+          cp src/ImGui_tmp/imgui*.cpp src/ImGui/
+          cp src/ImGui_tmp/imgui*.h src/ImGui/
+          mkdir -p src/ImGui/backends
+          cp src/ImGui_tmp/backends/imgui_impl_opengl3* src/ImGui/backends/
+          cp src/ImGui_tmp/backends/imgui_impl_android* src/ImGui/backends/
 
-      - name: Upload
-        uses: actions/upload-artifact@v4
+      - name: Build
+        run: |
+          mkdir build
+          cmake -B build \
+            -DCMAKE_TOOLCHAIN_FILE=${{ steps.ndk.outputs.ndk-path }}/build/cmake/android.toolchain.cmake \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-24 \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j$(nproc)
+
+      - uses: actions/upload-artifact@v4
         with:
           name: libPvpHud
-          path: libs/arm64-v8a/libPvpHud.so
+          path: build/output/libPvpHud.so
