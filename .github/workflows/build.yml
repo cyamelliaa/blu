@@ -1,42 +1,19 @@
-name: Build libPvpHud
+# 1. Clone pl dependencies
+mkdir -p deps/pl
+git clone https://github.com/SYsstemXD/Gloss deps/pl/gloss
+git clone https://github.com/Suicolen/Signature deps/pl/sig
+# Merge headers: copy Gloss.h, Signature.h into deps/pl/include/pl/
+# Merge sources: copy *.cpp into deps/pl/src/
 
-on:
-  push:
-    branches: [ main ]
-  workflow_dispatch:
+# 2. Configure (replace $NDK with your NDK path)
+cmake \
+  -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake \
+  -DANDROID_ABI=arm64-v8a \
+  -DANDROID_PLATFORM=android-26 \
+  -DCMAKE_BUILD_TYPE=Release \
+  -B build
 
-jobs:
-  build:
-    runs-on: ubuntu-latest
+# 3. Build
+cmake --build build
 
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: nttld/setup-ndk@v1
-        id: ndk
-        with:
-          ndk-version: r26b
-
-      - name: Clone ImGui into src/ImGui
-        run: |
-          mkdir -p src/ImGui/backends
-          git clone --depth=1 https://github.com/ocornut/imgui src/ImGui_tmp
-          cp src/ImGui_tmp/*.cpp src/ImGui/
-          cp src/ImGui_tmp/*.h src/ImGui/
-          cp src/ImGui_tmp/backends/imgui_impl_opengl3* src/ImGui/backends/
-          cp src/ImGui_tmp/backends/imgui_impl_android* src/ImGui/backends/
-
-      - name: Build
-        run: |
-          mkdir build
-          cmake -B build \
-            -DCMAKE_TOOLCHAIN_FILE=${{ steps.ndk.outputs.ndk-path }}/build/cmake/android.toolchain.cmake \
-            -DANDROID_ABI=arm64-v8a \
-            -DANDROID_PLATFORM=android-24 \
-            -DCMAKE_BUILD_TYPE=Release
-          cmake --build build -j$(nproc)
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: libPvpHud
-          path: build/output/libPvpHud.so
+# Output: build/ArmorFoodHUD.so
