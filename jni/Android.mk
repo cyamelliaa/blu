@@ -20,10 +20,8 @@ LOCAL_SRC_FILES := src/main.cpp
 LOCAL_C_INCLUDES := \
     $(LOCAL_PATH)/deps/imgui \
     $(LOCAL_PATH)/deps/imgui/backends \
-    $(LOCAL_PATH)/deps/dobby/include \
     $(LOCAL_PATH)/include
 LOCAL_STATIC_LIBRARIES := imgui
 LOCAL_LDLIBS    := -llog -landroid -lEGL -lGLESv3
-LOCAL_LDFLAGS   := -L$(LOCAL_PATH)/deps/dobby/lib -ldobby
 LOCAL_CPPFLAGS  := -std=c++17 -O2 -fvisibility=hidden
 include $(BUILD_SHARED_LIBRARY)
