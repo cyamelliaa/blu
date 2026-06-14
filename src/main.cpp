@@ -1,66 +1,35 @@
 #include <jni.h>
-#include <dlfcn.h>
 #include <android/log.h>
 #include <android/native_window.h>
+#include <android/native_window_jni.h>
 #include <android/input.h>
+#include <EGL/egl.h>
 #include <GLES3/gl3.h>
+#include <dlfcn.h>
+#include <sys/mman.h>
 #include <string>
 #include <cstring>
 #include <cmath>
 #include <cstdint>
 #include <vector>
-#include <sys/mman.h>
-
-static void inlineHook(void* target, void* replacement, void** original) {
-    // Save original bytes and write trampoline
-    static uint8_t trampoline[16];
-    memcpy(trampoline, target, 4);
-    // Write B (branch) instruction to replacement
-    // ARM64 B = 0x14000000 | ((offset >> 2) & 0x3FFFFFF)
-    uintptr_t from = (uintptr_t)target;
-    uintptr_t to   = (uintptr_t)replacement;
-    int64_t   off  = (int64_t)(to - from) >> 2;
-    uint32_t  insn = 0x14000000 | (uint32_t)(off & 0x3FFFFFF);
-    // Make memory writable
-    uintptr_t page = from & ~0xFFF;
-    mprotect((void*)page, 0x1000, PROT_READ | PROT_WRITE | PROT_EXEC);
-    memcpy(target, &insn, 4);
-    mprotect((void*)page, 0x1000, PROT_READ | PROT_EXEC);
-    *original = (void*)orig_eglSwapBuffers; // point to our saved copy
-}
-
-extern "C" __attribute__((visibility("default")))
-jint JNI_OnLoad(JavaVM* vm, void* reserved) {
-    LOGI("libPvpHud loading...");
-    void* libegl = dlopen("libEGL.so", RTLD_NOW | RTLD_GLOBAL);
-    if (!libegl) { LOGE("libEGL.so open failed"); return JNI_VERSION_1_6; }
-    void* addr = dlsym(libegl, "eglSwapBuffers");
-    if (!addr)  { LOGE("eglSwapBuffers not found"); return JNI_VERSION_1_6; }
-    // Save original and hook
-    orig_eglSwapBuffers = (fnEgl)addr;
-    inlineHook(addr, (void*)hook_eglSwapBuffers, (void**)&orig_eglSwapBuffers);
-    LOGI("Hooked eglSwapBuffers");
-    return JNI_VERSION_1_6;
-}
-
-#include <sys/stat.h>
-#include <fcntl.h>
 #include <unistd.h>
-#include <elf.h>
-#include <link.h>
 
-#include "imgui.h"
-#include "imgui_impl_opengl3.h"
-#include "imgui_impl_android.h"
+#include "pl/Hook.h"
+#include "pl/Gloss.h"
+#include "ImGui/imgui.h"
+#include "ImGui/backends/imgui_impl_opengl3.h"
+#include "ImGui/backends/imgui_impl_android.h"
 
 #define LOG_TAG "PvpHud"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
+// ============================================================
+//  Pattern scanner
+// ============================================================
 struct Pattern {
     std::vector<uint8_t> bytes;
     std::vector<bool>    mask;
-
     static Pattern parse(const char* pat) {
         Pattern p;
         const char* c = pat;
@@ -122,6 +91,9 @@ static uintptr_t patternScan(const char* soName, const char* patStr) {
     return 0;
 }
 
+// ============================================================
+//  Game function pointers
+// ============================================================
 static float (*fn_getHealth)(void*)     = nullptr;
 static float (*fn_getMaxHealth)(void*)  = nullptr;
 static int   (*fn_getFoodLevel)(void*)  = nullptr;
@@ -180,6 +152,9 @@ static void* getLocalPlayer() {
     return ((FnLP)vtable[3])(ci);
 }
 
+// ============================================================
+//  HUD state
+// ============================================================
 struct HudState {
     float health = 20.f, maxHealth = 20.f;
     int   foodLevel = 20;
@@ -225,6 +200,9 @@ static void refreshData() {
     }
 }
 
+// ============================================================
+//  ImGui drawing
+// ============================================================
 static ImVec4 durColor(float t) {
     if (t > 0.5f) return ImVec4(2.f*(1.f-t), 1.f, 0.f, 1.f);
     return ImVec4(1.f, 2.f*t, 0.f, 1.f);
@@ -319,6 +297,9 @@ static void initImGui(ANativeWindow* window) {
     LOGI("ImGui ready");
 }
 
+// ============================================================
+//  eglSwapBuffers hook via preloader's Gloss
+// ============================================================
 using fnEgl = unsigned int(*)(void*,void*);
 static fnEgl orig_eglSwapBuffers = nullptr;
 
@@ -337,26 +318,25 @@ static unsigned int hook_eglSwapBuffers(void* dpy, void* surface) {
     return orig_eglSwapBuffers(dpy, surface);
 }
 
-extern "C" __attribute__((visibility("default")))
-jint JNI_OnLoad(JavaVM* vm, void* reserved) {
-    LOGI("libPvpHud loading...");
-    void* libegl = dlopen("libEGL.so", RTLD_NOW | RTLD_GLOBAL);
-    if (!libegl) { LOGE("libEGL.so open failed"); return JNI_VERSION_1_6; }
-    void* addr = dlsym(libegl, "eglSwapBuffers");
-    if (!addr)  { LOGE("eglSwapBuffers not found"); return JNI_VERSION_1_6; }
-    DobbyHook(addr, (void*)hook_eglSwapBuffers, (void**)&orig_eglSwapBuffers);
-    LOGI("Hooked eglSwapBuffers");
-    return JNI_VERSION_1_6;
+LL_AUTO_STATIC_HOOK(
+    eglSwapBuffersHook,
+    HookPriority::Normal,
+    "eglSwapBuffers",
+    unsigned int,
+    (void* dpy, void* surface)
+) {
+    if (!orig_eglSwapBuffers) orig_eglSwapBuffers = (fnEgl)origin;
+    return hook_eglSwapBuffers(dpy, surface);
 }
 
-extern "C" __attribute__((visibility("default")))
-void Java_net_pvphud_NativeLib_onSurfaceCreated(JNIEnv* env, jclass, jobject surface) {
-    ANativeWindow* w = ANativeWindow_fromSurface(env, surface);
+LL_AUTO_STATIC_HOOK(
+    surfaceCreatedHook,
+    HookPriority::Normal,
+    "ANativeWindow_fromSurface",
+    ANativeWindow*,
+    (JNIEnv* env, jobject surface)
+) {
+    ANativeWindow* w = origin(env, surface);
     if (w) initImGui(w);
-}
-
-extern "C" __attribute__((visibility("default")))
-void Java_net_pvphud_NativeLib_onSurfaceChanged(JNIEnv* env, jclass, jint w, jint h) {
-    if (g_hud.imguiInitialized)
-        ImGui::GetIO().DisplaySize = {(float)w, (float)h};
+    return w;
 }
