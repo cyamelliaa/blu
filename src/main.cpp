@@ -22,7 +22,7 @@
 #include <elf.h>
 #include <link.h>
 
-#include "dobby.h"
+#include "GlossHook.h"
 #include "imgui.h"
 #include "imgui_impl_opengl3.h"
 #include "imgui_impl_android.h"
@@ -31,14 +31,9 @@
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
-// ============================================================
-//  Pattern scanner
-// ============================================================
-
-// Convert "A1 B2 ?? C3" string into bytes + mask
 struct Pattern {
     std::vector<uint8_t> bytes;
-    std::vector<bool>    mask;   // true = must match, false = wildcard
+    std::vector<bool>    mask;
 
     static Pattern parse(const char* pat) {
         Pattern p;
@@ -60,10 +55,7 @@ struct Pattern {
     }
 };
 
-struct SoInfo {
-    uintptr_t base = 0;
-    size_t    size = 0;
-};
+struct SoInfo { uintptr_t base = 0; size_t size = 0; };
 
 static SoInfo getSoInfo(const char* soName) {
     SoInfo info;
@@ -83,31 +75,20 @@ static SoInfo getSoInfo(const char* soName) {
     return info;
 }
 
-// Scan a memory region for a byte pattern, return absolute address or 0
 static uintptr_t patternScan(const char* soName, const char* patStr) {
     SoInfo so = getSoInfo(soName);
-    if (!so.base || !so.size) {
-        LOGE("patternScan: could not find %s in maps", soName);
-        return 0;
-    }
-
+    if (!so.base || !so.size) { LOGE("patternScan: could not find %s", soName); return 0; }
     Pattern pat = Pattern::parse(patStr);
     if (pat.bytes.empty()) return 0;
-
-    const uint8_t* mem   = (const uint8_t*)so.base;
-    const size_t   plen  = pat.bytes.size();
-
+    const uint8_t* mem  = (const uint8_t*)so.base;
+    const size_t   plen = pat.bytes.size();
     for (size_t i = 0; i + plen <= so.size; i++) {
         bool found = true;
         for (size_t j = 0; j < plen; j++) {
-            if (pat.mask[j] && mem[i + j] != pat.bytes[j]) {
-                found = false;
-                break;
-            }
+            if (pat.mask[j] && mem[i + j] != pat.bytes[j]) { found = false; break; }
         }
         if (found) {
-            LOGI("patternScan: '%s' found at 0x%lx (offset 0x%lx)",
-                 patStr, so.base + i, i);
+            LOGI("patternScan: '%s' found at 0x%lx", patStr, so.base + i);
             return so.base + i;
         }
     }
@@ -115,88 +96,35 @@ static uintptr_t patternScan(const char* soName, const char* patStr) {
     return 0;
 }
 
-// Follow a relative BL/B branch at `addr` and return the target function
-static uintptr_t followBranch(uintptr_t addr) {
-    // ARM64: BL = 0x94000000 | (offset & 0x3FFFFFF)
-    uint32_t instr = *(uint32_t*)addr;
-    if ((instr & 0xFC000000) == 0x94000000 ||   // BL
-        (instr & 0xFC000000) == 0x14000000) {    // B
-        int32_t offset = (int32_t)((instr & 0x3FFFFFF) << 2);
-        if (offset & 0x8000000) offset |= 0xF0000000; // sign extend
-        return addr + offset;
-    }
-    return addr; // not a branch, return as-is
-}
+static float (*fn_getHealth)(void*)     = nullptr;
+static float (*fn_getMaxHealth)(void*)  = nullptr;
+static int   (*fn_getFoodLevel)(void*)  = nullptr;
+static float (*fn_getSaturation)(void*) = nullptr;
+static int   (*fn_getXpLevel)(void*)    = nullptr;
+static void* (*fn_getInventory)(void*)  = nullptr;
+static void* (*fn_getItem)(void*, int)  = nullptr;
+static bool  (*fn_itemIsNull)(void*)    = nullptr;
+static int   (*fn_getDamage)(void*)     = nullptr;
+static int   (*fn_getMaxDamage)(void*)  = nullptr;
 
-// ============================================================
-//  Resolved function pointers (filled by initOffsets)
-// ============================================================
-static float (*fn_getHealth)(void*)      = nullptr;
-static float (*fn_getMaxHealth)(void*)   = nullptr;
-static int   (*fn_getFoodLevel)(void*)   = nullptr;
-static float (*fn_getSaturation)(void*)  = nullptr;
-static int   (*fn_getXpLevel)(void*)     = nullptr;
-static void* (*fn_getInventory)(void*)   = nullptr;
-static void* (*fn_getItem)(void*, int)   = nullptr;
-static bool  (*fn_itemIsNull)(void*)     = nullptr;
-static int   (*fn_getDamage)(void*)      = nullptr;
-static int   (*fn_getMaxDamage)(void*)   = nullptr;
-
-// ============================================================
-//  Patterns — ARM64 byte sequences near key functions
-//  These are for MCBE 1.21.x; update the ?? wildcards widen
-//  matches across minor versions.
-//
-//  HOW TO FIND YOUR OWN:
-//  1. Open libminecraftpe.so in Ghidra (free, runs on PC/Mac/Linux)
-//  2. Search for the function (e.g. "getHealth")
-//  3. View the disassembly, copy 6-8 unique bytes from the start
-//  4. Replace version-specific bytes with ?? wildcards
-// ============================================================
 namespace Patterns {
-    // Actor::getHealth() — returns float health value
-    // Look for: LDR X0,[X0,#offset] ; FMOV S0,W0 near "health" attribute
     const char* getHealth    = "F4 4F BE A9 FD 7B 01 A9 FD 43 00 91 F3 03 00 AA";
-
-    // Actor::getMaxHealth()
     const char* getMaxHealth = "F4 4F BE A9 FD 7B 01 A9 FD 43 00 91 F3 03 00 AA ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? E0 03 13 AA";
-
-    // Player::getFoodLevel() — returns int
     const char* getFoodLevel = "08 28 40 F9 09 01 40 F9 28 01 40 F9 00 01 40 F9";
-
-    // Player::getFoodSaturationLevel() — returns float
-    const char* getSaturation = "08 28 40 F9 09 01 40 F9 28 01 40 F9 20 01 40 F9";
-
-    // Player::getXpLevel() — returns int
+    const char* getSaturation= "08 28 40 F9 09 01 40 F9 28 01 40 F9 20 01 40 F9";
     const char* getXpLevel   = "08 28 40 F9 ?? ?? 40 F9 00 01 40 F9 ?? ?? ?? 94";
-
-    // Player::getSupplies() — returns PlayerInventory*
     const char* getInventory = "F3 03 00 AA ?? ?? ?? ?? 60 ?? 40 F9 ?? ?? ?? 94 E0 03 00 AA";
-
-    // SimpleContainer::getItem(int) — returns ItemStack*
     const char* getItem      = "09 00 80 52 2A 69 6A 78 4A 01 09 0B 00 69 6A 38";
-
-    // ItemStack::isNull() — returns bool
     const char* itemIsNull   = "00 00 80 D2 ?? ?? ?? ?? ?? ?? 40 F9 C0 03 5F D6";
-
-    // ItemStack::getDamageValue() — returns int
     const char* getDamage    = "F4 4F BE A9 FD 7B 01 A9 FD 43 00 91 ?? ?? 40 F9 ?? ?? 40 F9 ?? ?? 40 F9 00 04 40 F9";
-
-    // ItemStack::getMaxDamage() — returns int
     const char* getMaxDamage = "F4 4F BE A9 FD 7B 01 A9 FD 43 00 91 ?? ?? 40 F9 ?? ?? 40 F9 60 00 40 F9";
 }
 
 static bool g_offsetsFound = false;
-
 static void initOffsets() {
     if (g_offsetsFound) return;
     LOGI("Scanning for offsets...");
-
-    #define SCAN(fn, pat) \
-        { uintptr_t a = patternScan("libminecraftpe.so", pat); \
-          if (a) fn = (decltype(fn))a; \
-          else LOGE("MISSING: " #fn); }
-
+    #define SCAN(fn, pat) { uintptr_t a = patternScan("libminecraftpe.so", pat); if (a) fn = (decltype(fn))a; else LOGE("MISSING: " #fn); }
     SCAN(fn_getHealth,    Patterns::getHealth)
     SCAN(fn_getMaxHealth, Patterns::getMaxHealth)
     SCAN(fn_getFoodLevel, Patterns::getFoodLevel)
@@ -207,18 +135,12 @@ static void initOffsets() {
     SCAN(fn_itemIsNull,   Patterns::itemIsNull)
     SCAN(fn_getDamage,    Patterns::getDamage)
     SCAN(fn_getMaxDamage, Patterns::getMaxDamage)
-
     #undef SCAN
     g_offsetsFound = true;
     LOGI("Offset scan complete.");
 }
 
-// ============================================================
-//  ClientInstance / LocalPlayer resolution
-// ============================================================
 static void* getLocalPlayer() {
-    // ClientInstance::getInstance() is a simple exported symbol,
-    // still present in most MCBE versions
     using Fn = void*(*)();
     static auto getInstance = (Fn)dlsym(
         dlopen("libminecraftpe.so", RTLD_NOW | RTLD_NOLOAD),
@@ -227,21 +149,16 @@ static void* getLocalPlayer() {
     if (!getInstance) return nullptr;
     void* ci = getInstance();
     if (!ci) return nullptr;
-
-    // getLocalPlayer via vtable index 3 (stable across versions)
     void** vtable = *(void***)ci;
     using FnLP = void*(*)(void*);
     return ((FnLP)vtable[3])(ci);
 }
 
-// ============================================================
-//  HUD state
-// ============================================================
 struct HudState {
-    float health     = 20.f, maxHealth = 20.f;
-    int   foodLevel  = 20;
+    float health = 20.f, maxHealth = 20.f;
+    int   foodLevel = 20;
     float saturation = 5.f;
-    int   xpLevel    = 0;
+    int   xpLevel = 0;
     float armorDur[4]      = {1,1,1,1};
     bool  armorEquipped[4] = {};
     float offhandDur       = 1.f;
@@ -263,16 +180,13 @@ static float safeGetDurability(void* item) {
 static void refreshData() {
     void* player = getLocalPlayer();
     if (!player) return;
-
     if (fn_getHealth)    g_hud.health     = fn_getHealth(player);
     if (fn_getMaxHealth) g_hud.maxHealth  = fn_getMaxHealth(player);
     if (fn_getFoodLevel) g_hud.foodLevel  = fn_getFoodLevel(player);
     if (fn_getSaturation)g_hud.saturation = fn_getSaturation(player);
     if (fn_getXpLevel)   g_hud.xpLevel    = fn_getXpLevel(player);
-
     void* inv = fn_getInventory ? fn_getInventory(player) : nullptr;
     if (inv && fn_getItem) {
-        // Armor slots 36-39, offhand 40 (common MCBE layout)
         for (int i = 0; i < 4; i++) {
             void* item = fn_getItem(inv, 36 + i);
             bool  eq   = item && fn_itemIsNull && !fn_itemIsNull(item);
@@ -285,9 +199,6 @@ static void refreshData() {
     }
 }
 
-// ============================================================
-//  ImGui HUD rendering
-// ============================================================
 static ImVec4 durColor(float t) {
     if (t > 0.5f) return ImVec4(2.f*(1.f-t), 1.f, 0.f, 1.f);
     return ImVec4(1.f, 2.f*t, 0.f, 1.f);
@@ -296,7 +207,6 @@ static ImVec4 durColor(float t) {
 static void drawHUD() {
     ImGuiIO& io = ImGui::GetIO();
 
-    // --- Health ---
     ImGui::SetNextWindowBgAlpha(0.6f);
     ImGui::SetNextWindowPos({10, io.DisplaySize.y - 160});
     ImGui::SetNextWindowSize({210, 50});
@@ -310,25 +220,23 @@ static void drawHUD() {
     ImGui::PopStyleColor();
     ImGui::End();
 
-    // --- Food + Saturation ---
     ImGui::SetNextWindowBgAlpha(0.6f);
     ImGui::SetNextWindowPos({10, io.DisplaySize.y - 105});
     ImGui::SetNextWindowSize({210, 55});
     ImGui::Begin("##food", nullptr, ImGuiWindowFlags_NoDecoration|ImGuiWindowFlags_NoInputs|ImGuiWindowFlags_NoMove);
-    ImGui::TextColored({.9f,.65f,.2f,1}, "\U0001F356 Food"); ImGui::SameLine();
+    ImGui::TextColored({.9f,.65f,.2f,1}, "Food"); ImGui::SameLine();
     ImGui::Text("%d/20", g_hud.foodLevel);
     ImGui::PushStyleColor(ImGuiCol_PlotHistogram, ImVec4(.8f,.55f,.1f,1));
     ImGui::ProgressBar(g_hud.foodLevel/20.f, {-1,6}, "");
     ImGui::PopStyleColor();
     float satPct = fminf(g_hud.saturation/20.f, 1.f);
-    ImGui::TextColored({.9f,.3f,.8f,1}, "\u2605 Sat"); ImGui::SameLine();
+    ImGui::TextColored({.9f,.3f,.8f,1}, "Sat"); ImGui::SameLine();
     ImGui::Text("%.1f", g_hud.saturation);
     ImGui::PushStyleColor(ImGuiCol_PlotHistogram, ImVec4(.8f,.2f,.8f,.8f));
     ImGui::ProgressBar(satPct, {-1,6}, "");
     ImGui::PopStyleColor();
     ImGui::End();
 
-    // --- Armor ---
     const char* slotName[4] = {"Helm","Chest","Legs","Boots"};
     ImGui::SetNextWindowBgAlpha(0.6f);
     ImGui::SetNextWindowPos({io.DisplaySize.x - 165, 10});
@@ -345,7 +253,6 @@ static void drawHUD() {
     }
     ImGui::End();
 
-    // --- Offhand ---
     ImGui::SetNextWindowBgAlpha(0.6f);
     ImGui::SetNextWindowPos({io.DisplaySize.x - 165, 148});
     ImGui::SetNextWindowSize({155, 45});
@@ -360,18 +267,14 @@ static void drawHUD() {
     }
     ImGui::End();
 
-    // --- XP ---
     ImGui::SetNextWindowBgAlpha(0.6f);
     ImGui::SetNextWindowPos({10, 10});
     ImGui::SetNextWindowSize({130, 30});
     ImGui::Begin("##xp", nullptr, ImGuiWindowFlags_NoDecoration|ImGuiWindowFlags_NoInputs|ImGuiWindowFlags_NoMove);
-    ImGui::TextColored({.3f,1,.3f,1}, "\u272A XP Lvl: %d", g_hud.xpLevel);
+    ImGui::TextColored({.3f,1,.3f,1}, "XP Lvl: %d", g_hud.xpLevel);
     ImGui::End();
 }
 
-// ============================================================
-//  ImGui init
-// ============================================================
 static void initImGui(ANativeWindow* window) {
     if (g_hud.imguiInitialized) return;
     g_hud.window = window;
@@ -390,20 +293,14 @@ static void initImGui(ANativeWindow* window) {
     LOGI("ImGui ready");
 }
 
-// ============================================================
-//  eglSwapBuffers hook
-// ============================================================
 using fnEgl = unsigned int(*)(void*,void*);
 static fnEgl orig_eglSwapBuffers = nullptr;
 
 static unsigned int hook_eglSwapBuffers(void* dpy, void* surface) {
     if (g_hud.imguiInitialized) {
-        // Scan offsets once after game has loaded
         static bool scanned = false;
         if (!scanned) { initOffsets(); scanned = true; }
-
         refreshData();
-
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplAndroid_NewFrame();
         ImGui::NewFrame();
@@ -414,9 +311,6 @@ static unsigned int hook_eglSwapBuffers(void* dpy, void* surface) {
     return orig_eglSwapBuffers(dpy, surface);
 }
 
-// ============================================================
-//  JNI entry
-// ============================================================
 extern "C" __attribute__((visibility("default")))
 jint JNI_OnLoad(JavaVM* vm, void* reserved) {
     LOGI("libPvpHud loading...");
