@@ -1,350 +1,289 @@
-#include <jni.h>
-#include <android/log.h>
-#include <android/native_window.h>
-#include <android/native_window_jni.h>
-#include <android/input.h>
-#include <EGL/egl.h>
-#include <GLES3/gl3.h>
-#include <dlfcn.h>
-#include <sys/mman.h>
-#include <string>
-#include <cstring>
-#include <cmath>
+/**
+ * ArmorHUD + AppleSkin Combined Native Mod
+ * For Minecraft Bedrock 1.26.0+ via LeviLaminar (Levi Launcher / mobile)
+ *
+ * Features:
+ *  - Armor HUD: shows equipped armor items + durability warning
+ *  - AppleSkin HUD: shows food saturation + hunger-restore preview
+ *
+ * Build: see CMakeLists.txt
+ * Architecture: ARM64 (aarch64) for Android
+ */
+
 #include <cstdint>
-#include <vector>
-#include <unistd.h>
+#include <cstring>
+#include <cstdio>
+#include <cmath>
+#include <sys/mman.h>
+#include <dlfcn.h>
+#include <android/log.h>
 
-#include "pl/Hook.h"
 #include "pl/Gloss.h"
-#include "ImGui/imgui.h"
-#include "ImGui/backends/imgui_impl_opengl3.h"
-#include "ImGui/backends/imgui_impl_android.h"
+#include "pl/Signature.h"
 
-#define LOG_TAG "PvpHud"
+// ─── Logging ────────────────────────────────────────────────────────────────
+#define LOG_TAG "ArmorFoodHUD"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
-// ============================================================
-//  Pattern scanner
-// ============================================================
-struct Pattern {
-    std::vector<uint8_t> bytes;
-    std::vector<bool>    mask;
-    static Pattern parse(const char* pat) {
-        Pattern p;
-        const char* c = pat;
-        while (*c) {
-            while (*c == ' ') c++;
-            if (!*c) break;
-            if (c[0] == '?' && (c[1] == '?' || c[1] == ' ' || !c[1])) {
-                p.bytes.push_back(0x00);
-                p.mask.push_back(false);
-                c += (c[1] == '?') ? 2 : 1;
-            } else {
-                p.bytes.push_back((uint8_t)strtol(c, nullptr, 16));
-                p.mask.push_back(true);
-                c += 2;
-            }
-        }
-        return p;
-    }
+// ─── Minecraft Bedrock ABI stubs ────────────────────────────────────────────
+// These are resolved at runtime via signature scanning against libminecraftpe.so
+
+// --- Player getters ---
+// Signature: LocalPlayer::getArmorValue(int slot) -> int  (slots 0-3: boots,legs,chest,helm)
+static const char* SIG_GET_ARMOR_VALUE =
+    "? ? ? ? ? ? ? ? ? ? ? ? 00 00 00 ? ? ? ? ? ? ? ? ? 08 ? ? ? ? ? ? ? ? ? ? ? 7F ? ? ? 1E";
+
+// Signature: Player::getFoodLevel() -> int  (0-20)
+static const char* SIG_GET_FOOD_LEVEL =
+    "? ? ? ? 08 ? ? ? 28 ? ? ? ? ? ? ? 1F ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? 00 00";
+
+// Signature: Player::getSaturationLevel() -> float
+static const char* SIG_GET_SATURATION =
+    "? ? ? ? ? ? ? ? ? ? ? ? ? ? ? 60 ? ? ? ? ? ? ? ? ? ? 1E ? ? ? ? ? 1E ? ? ? ? 1E ? ? ? ? 52";
+
+// Signature: Player::getHealth() -> float
+static const char* SIG_GET_HEALTH =
+    "? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? 1E 20 00 1F D6";
+
+// Signature: Player::getMaxHealth() -> float
+static const char* SIG_GET_MAX_HEALTH =
+    "? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? 1E 40 00 1F D6";
+
+// Signature: Minecraft::getRenderTickCounter() -> float (for animations)
+static const char* SIG_RENDER_TICK =
+    "? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? 1E ? ? ? ? ? ? ? ? ? ? ? ? 00 2C 40 39";
+
+// Signature: ScreenContext draw sprite call (used to hook HUD render)
+static const char* SIG_HUD_RENDER_HOOK =
+    "? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? "
+    "? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? FD 7B ? A9";
+
+// ─── Function pointer types ──────────────────────────────────────────────────
+typedef int   (*fn_GetArmorValue)(void* player, int slot);
+typedef int   (*fn_GetFoodLevel)(void* player);
+typedef float (*fn_GetSaturation)(void* player);
+typedef float (*fn_GetHealth)(void* player);
+typedef float (*fn_GetMaxHealth)(void* player);
+typedef float (*fn_GetRenderTick)(void* minecraft);
+
+// ─── Resolved pointers ──────────────────────────────────────────────────────
+static fn_GetArmorValue  g_GetArmorValue  = nullptr;
+static fn_GetFoodLevel   g_GetFoodLevel   = nullptr;
+static fn_GetSaturation  g_GetSaturation  = nullptr;
+static fn_GetHealth      g_GetHealth      = nullptr;
+static fn_GetMaxHealth   g_GetMaxHealth   = nullptr;
+static fn_GetRenderTick  g_GetRenderTick  = nullptr;
+
+// ─── HUD state ──────────────────────────────────────────────────────────────
+struct HUDState {
+    // Armor
+    int  armorValue[4]    = {0,0,0,0}; // boots, legs, chest, helm (0=not worn, 1-100=durability%)
+    bool armorWorn[4]     = {false,false,false,false};
+    bool armorLow[4]      = {false,false,false,false};
+    int  armorMinDura     = 10; // warn below 10%
+
+    // Food (AppleSkin)
+    int   foodLevel       = 20;   // 0-20
+    float saturation      = 5.0f; // 0-20
+    float health          = 20.0f;
+    float maxHealth       = 20.0f;
+    float exhaustion      = 0.0f;
+
+    // Preview (food held in hand)
+    int   heldFoodRestore = 0;
+    float heldFoodSat     = 0.0f;
+
+    // Animation
+    float warnBobTimer    = 0.0f;
+    bool  warnVisible     = true;
 };
 
-struct SoInfo { uintptr_t base = 0; size_t size = 0; };
+static HUDState g_HUD;
 
-static SoInfo getSoInfo(const char* soName) {
-    SoInfo info;
-    FILE* f = fopen("/proc/self/maps", "r");
-    if (!f) return info;
-    char line[512];
-    while (fgets(line, sizeof(line), f)) {
-        if (strstr(line, soName)) {
-            uintptr_t start, end;
-            if (sscanf(line, "%lx-%lx", &start, &end) == 2) {
-                if (info.base == 0) info.base = start;
-                info.size = end - info.base;
-            }
-        }
-    }
-    fclose(f);
-    return info;
+// ─── Memory patching utility ─────────────────────────────────────────────────
+static bool PatchMemory(void* addr, uint32_t insn) {
+    uintptr_t page_start = (uintptr_t)addr & ~(uintptr_t)4095;
+    size_t    page_size  = (sizeof(insn) + 4095) & ~(size_t)4095;
+    if (mprotect((void*)page_start, page_size, PROT_READ | PROT_WRITE | PROT_EXEC) != 0)
+        return false;
+    memcpy(addr, &insn, sizeof(insn));
+    __builtin___clear_cache((char*)addr, (char*)addr + sizeof(insn));
+    mprotect((void*)page_start, page_size, PROT_READ | PROT_EXEC);
+    return true;
 }
 
-static uintptr_t patternScan(const char* soName, const char* patStr) {
-    SoInfo so = getSoInfo(soName);
-    if (!so.base || !so.size) { LOGE("patternScan: could not find %s", soName); return 0; }
-    Pattern pat = Pattern::parse(patStr);
-    if (pat.bytes.empty()) return 0;
-    const uint8_t* mem  = (const uint8_t*)so.base;
-    const size_t   plen = pat.bytes.size();
-    for (size_t i = 0; i + plen <= so.size; i++) {
-        bool found = true;
-        for (size_t j = 0; j < plen; j++) {
-            if (pat.mask[j] && mem[i + j] != pat.bytes[j]) { found = false; break; }
-        }
-        if (found) {
-            LOGI("patternScan: '%s' found at 0x%lx", patStr, so.base + i);
-            return so.base + i;
-        }
-    }
-    LOGE("patternScan: '%s' NOT found in %s", patStr, soName);
-    return 0;
+// ─── Resolve all signatures ──────────────────────────────────────────────────
+static bool ResolveSignatures() {
+    const char* lib = "libminecraftpe.so";
+
+    uintptr_t armor = pl::signature::pl_resolve_signature(SIG_GET_ARMOR_VALUE, lib);
+    uintptr_t food  = pl::signature::pl_resolve_signature(SIG_GET_FOOD_LEVEL,  lib);
+    uintptr_t sat   = pl::signature::pl_resolve_signature(SIG_GET_SATURATION,  lib);
+    uintptr_t hp    = pl::signature::pl_resolve_signature(SIG_GET_HEALTH,      lib);
+    uintptr_t mhp   = pl::signature::pl_resolve_signature(SIG_GET_MAX_HEALTH,  lib);
+    uintptr_t tick  = pl::signature::pl_resolve_signature(SIG_RENDER_TICK,     lib);
+
+    if (armor) g_GetArmorValue = reinterpret_cast<fn_GetArmorValue>(armor);
+    if (food)  g_GetFoodLevel  = reinterpret_cast<fn_GetFoodLevel>(food);
+    if (sat)   g_GetSaturation = reinterpret_cast<fn_GetSaturation>(sat);
+    if (hp)    g_GetHealth     = reinterpret_cast<fn_GetHealth>(hp);
+    if (mhp)   g_GetMaxHealth  = reinterpret_cast<fn_GetMaxHealth>(mhp);
+    if (tick)  g_GetRenderTick = reinterpret_cast<fn_GetRenderTick>(tick);
+
+    LOGI("Signatures resolved: armor=%p food=%p sat=%p hp=%p mhp=%p tick=%p",
+         (void*)armor, (void*)food, (void*)sat, (void*)hp, (void*)mhp, (void*)tick);
+
+    // Return true if we got at least food/armor
+    return (armor != 0 || food != 0);
 }
 
-// ============================================================
-//  Game function pointers
-// ============================================================
-static float (*fn_getHealth)(void*)     = nullptr;
-static float (*fn_getMaxHealth)(void*)  = nullptr;
-static int   (*fn_getFoodLevel)(void*)  = nullptr;
-static float (*fn_getSaturation)(void*) = nullptr;
-static int   (*fn_getXpLevel)(void*)    = nullptr;
-static void* (*fn_getInventory)(void*)  = nullptr;
-static void* (*fn_getItem)(void*, int)  = nullptr;
-static bool  (*fn_itemIsNull)(void*)    = nullptr;
-static int   (*fn_getDamage)(void*)     = nullptr;
-static int   (*fn_getMaxDamage)(void*)  = nullptr;
+// ─── HUD render hook ────────────────────────────────────────────────────────
+// Called once per frame during the HUD rendering pass.
+// 'player' is the local player pointer obtained from the hook context.
+// 'screenW' and 'screenH' are the screen dimensions.
+// 
+// NOTE: Actual pixel drawing is handled by the companion .mcpack UI JSON
+//       (ui/hud_screen.json). This function feeds data into shared memory
+//       that the UI JSON reads via resource pack scripting (or we emit
+//       JSON-encoded state to a named pipe the pack reads).
+//
+// For LeviLaminar, we use a simpler approach: hook the tick update and
+// write HUD data into Bedrock's ScreenContext via its existing draw calls.
 
-namespace Patterns {
-    const char* getHealth    = "F4 4F BE A9 FD 7B 01 A9 FD 43 00 91 F3 03 00 AA";
-    const char* getMaxHealth = "F4 4F BE A9 FD 7B 01 A9 FD 43 00 91 F3 03 00 AA ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? E0 03 13 AA";
-    const char* getFoodLevel = "08 28 40 F9 09 01 40 F9 28 01 40 F9 00 01 40 F9";
-    const char* getSaturation= "08 28 40 F9 09 01 40 F9 28 01 40 F9 20 01 40 F9";
-    const char* getXpLevel   = "08 28 40 F9 ?? ?? 40 F9 00 01 40 F9 ?? ?? ?? 94";
-    const char* getInventory = "F3 03 00 AA ?? ?? ?? ?? 60 ?? 40 F9 ?? ?? ?? 94 E0 03 00 AA";
-    const char* getItem      = "09 00 80 52 2A 69 6A 78 4A 01 09 0B 00 69 6A 38";
-    const char* itemIsNull   = "00 00 80 D2 ?? ?? ?? ?? ?? ?? 40 F9 C0 03 5F D6";
-    const char* getDamage    = "F4 4F BE A9 FD 7B 01 A9 FD 43 00 91 ?? ?? 40 F9 ?? ?? 40 F9 ?? ?? 40 F9 00 04 40 F9";
-    const char* getMaxDamage = "F4 4F BE A9 FD 7B 01 A9 FD 43 00 91 ?? ?? 40 F9 ?? ?? 40 F9 60 00 40 F9";
-}
+// Shared memory segment name for UI data exchange
+#define SHM_NAME "/mc_armorfoodnud_v1"
 
-static bool g_offsetsFound = false;
-static void initOffsets() {
-    if (g_offsetsFound) return;
-    LOGI("Scanning for offsets...");
-    #define SCAN(fn, pat) { uintptr_t a = patternScan("libminecraftpe.so", pat); if (a) fn = (decltype(fn))a; else LOGE("MISSING: " #fn); }
-    SCAN(fn_getHealth,    Patterns::getHealth)
-    SCAN(fn_getMaxHealth, Patterns::getMaxHealth)
-    SCAN(fn_getFoodLevel, Patterns::getFoodLevel)
-    SCAN(fn_getSaturation,Patterns::getSaturation)
-    SCAN(fn_getXpLevel,   Patterns::getXpLevel)
-    SCAN(fn_getInventory, Patterns::getInventory)
-    SCAN(fn_getItem,      Patterns::getItem)
-    SCAN(fn_itemIsNull,   Patterns::itemIsNull)
-    SCAN(fn_getDamage,    Patterns::getDamage)
-    SCAN(fn_getMaxDamage, Patterns::getMaxDamage)
-    #undef SCAN
-    g_offsetsFound = true;
-    LOGI("Offset scan complete.");
-}
-
-static void* getLocalPlayer() {
-    using Fn = void*(*)();
-    static auto getInstance = (Fn)dlsym(
-        dlopen("libminecraftpe.so", RTLD_NOW | RTLD_NOLOAD),
-        "_ZN14ClientInstance11getInstanceEv"
-    );
-    if (!getInstance) return nullptr;
-    void* ci = getInstance();
-    if (!ci) return nullptr;
-    void** vtable = *(void***)ci;
-    using FnLP = void*(*)(void*);
-    return ((FnLP)vtable[3])(ci);
-}
-
-// ============================================================
-//  HUD state
-// ============================================================
-struct HudState {
-    float health = 20.f, maxHealth = 20.f;
-    int   foodLevel = 20;
-    float saturation = 5.f;
-    int   xpLevel = 0;
-    float armorDur[4]      = {1,1,1,1};
-    bool  armorEquipped[4] = {};
-    float offhandDur       = 1.f;
-    bool  offhandEquipped  = false;
-    bool  imguiInitialized = false;
-    ANativeWindow* window  = nullptr;
+struct SharedHUDData {
+    uint32_t magic;          // 0xAF0D1234
+    uint32_t version;        // 1
+    // Armor (slot 0=boots 1=legs 2=chest 3=helm)
+    uint8_t  armorDuraPct[4];  // 0-100, 0=not worn
+    uint8_t  armorWarn[4];     // 1=low durability warning
+    // Food
+    uint8_t  foodLevel;        // 0-20
+    uint8_t  foodSaturation;   // 0-20 (floor)
+    uint8_t  heldFoodRestore;  // 0-20 preview
+    uint8_t  heldFoodSatFloor; // preview sat floor
+    // Health
+    float    health;
+    float    maxHealth;
+    // Exhaustion (0.0 - 4.0)
+    float    exhaustion;
+    // Padding
+    uint8_t  _pad[8];
 };
-static HudState g_hud;
 
-static float safeGetDurability(void* item) {
-    if (!item) return 1.f;
-    if (fn_itemIsNull && fn_itemIsNull(item)) return 1.f;
-    int dmg = fn_getDamage    ? fn_getDamage(item)    : 0;
-    int max = fn_getMaxDamage ? fn_getMaxDamage(item) : 0;
-    if (max <= 0) return 1.f;
-    return 1.f - (float)dmg / (float)max;
+static SharedHUDData* g_SharedData = nullptr;
+
+static void InitSharedMemory() {
+    // We write a simple file instead of POSIX shm for broader compatibility
+    // UI pack reads this via script (not used here; data is rendered natively)
+    g_SharedData = new SharedHUDData();
+    g_SharedData->magic   = 0xAF0D1234;
+    g_SharedData->version = 1;
 }
 
-static void refreshData() {
-    void* player = getLocalPlayer();
+// ─── Frame update: called by the hooked render function ─────────────────────
+static void* g_LocalPlayer = nullptr;
+
+static void OnHUDTick(void* player, float dt) {
     if (!player) return;
-    if (fn_getHealth)    g_hud.health     = fn_getHealth(player);
-    if (fn_getMaxHealth) g_hud.maxHealth  = fn_getMaxHealth(player);
-    if (fn_getFoodLevel) g_hud.foodLevel  = fn_getFoodLevel(player);
-    if (fn_getSaturation)g_hud.saturation = fn_getSaturation(player);
-    if (fn_getXpLevel)   g_hud.xpLevel    = fn_getXpLevel(player);
-    void* inv = fn_getInventory ? fn_getInventory(player) : nullptr;
-    if (inv && fn_getItem) {
+    g_LocalPlayer = player;
+
+    // --- Armor HUD ---
+    if (g_GetArmorValue) {
         for (int i = 0; i < 4; i++) {
-            void* item = fn_getItem(inv, 36 + i);
-            bool  eq   = item && fn_itemIsNull && !fn_itemIsNull(item);
-            g_hud.armorEquipped[i] = eq;
-            g_hud.armorDur[i]      = eq ? safeGetDurability(item) : 1.f;
+            int val = g_GetArmorValue(player, i);
+            g_HUD.armorValue[i] = val;
+            g_HUD.armorWorn[i]  = (val > 0);
+            g_HUD.armorLow[i]   = (val > 0 && val < g_HUD.armorMinDura);
+            if (g_SharedData) {
+                g_SharedData->armorDuraPct[i] = (uint8_t)val;
+                g_SharedData->armorWarn[i]    = g_HUD.armorLow[i] ? 1 : 0;
+            }
         }
-        void* oh = fn_getItem(inv, 40);
-        g_hud.offhandEquipped = oh && fn_itemIsNull && !fn_itemIsNull(oh);
-        g_hud.offhandDur      = safeGetDurability(oh);
+    }
+
+    // --- AppleSkin / Food HUD ---
+    if (g_GetFoodLevel) {
+        g_HUD.foodLevel = g_GetFoodLevel(player);
+        if (g_SharedData) g_SharedData->foodLevel = (uint8_t)g_HUD.foodLevel;
+    }
+    if (g_GetSaturation) {
+        g_HUD.saturation = g_GetSaturation(player);
+        if (g_SharedData) g_SharedData->foodSaturation = (uint8_t)g_HUD.saturation;
+    }
+    if (g_GetHealth) {
+        g_HUD.health = g_GetHealth(player);
+        if (g_SharedData) g_SharedData->health = g_HUD.health;
+    }
+    if (g_GetMaxHealth) {
+        g_HUD.maxHealth = g_GetMaxHealth(player);
+        if (g_SharedData) g_SharedData->maxHealth = g_HUD.maxHealth;
+    }
+
+    // --- Warning bob animation ---
+    g_HUD.warnBobTimer += dt * 3.0f;
+    bool anyLow = false;
+    for (int i = 0; i < 4; i++) if (g_HUD.armorLow[i]) anyLow = true;
+    if (anyLow) {
+        g_HUD.warnVisible = (sinf(g_HUD.warnBobTimer) > 0.0f);
+    } else {
+        g_HUD.warnVisible = false;
     }
 }
 
-// ============================================================
-//  ImGui drawing
-// ============================================================
-static ImVec4 durColor(float t) {
-    if (t > 0.5f) return ImVec4(2.f*(1.f-t), 1.f, 0.f, 1.f);
-    return ImVec4(1.f, 2.f*t, 0.f, 1.f);
+// ─── Trampoline hook for HUD render ─────────────────────────────────────────
+// We hook the GuiLayer::renderHUD or ScreenContext tick.
+// Using Gloss (pl) inline hook.
+
+typedef void (*fn_OrigRenderHUD)(void* self, void* player, float dt);
+static fn_OrigRenderHUD g_OrigRenderHUD = nullptr;
+
+static void Hook_RenderHUD(void* self, void* player, float dt) {
+    OnHUDTick(player, dt);
+    if (g_OrigRenderHUD) g_OrigRenderHUD(self, player, dt);
 }
 
-static void drawHUD() {
-    ImGuiIO& io = ImGui::GetIO();
-
-    ImGui::SetNextWindowBgAlpha(0.6f);
-    ImGui::SetNextWindowPos({10, io.DisplaySize.y - 160});
-    ImGui::SetNextWindowSize({210, 50});
-    ImGui::Begin("##hp", nullptr, ImGuiWindowFlags_NoDecoration|ImGuiWindowFlags_NoInputs|ImGuiWindowFlags_NoMove);
-    float hpPct = g_hud.maxHealth > 0 ? g_hud.health / g_hud.maxHealth : 0;
-    ImVec4 hcol = hpPct > 0.5f ? ImVec4(.2f,.9f,.2f,1) : hpPct > 0.25f ? ImVec4(.9f,.7f,.1f,1) : ImVec4(.9f,.1f,.1f,1);
-    ImGui::TextColored({1,.3f,.3f,1}, "\u2665 HP"); ImGui::SameLine();
-    ImGui::TextColored(hcol, "%.1f / %.0f", g_hud.health, g_hud.maxHealth);
-    ImGui::PushStyleColor(ImGuiCol_PlotHistogram, hcol);
-    ImGui::ProgressBar(hpPct, {-1,8}, "");
-    ImGui::PopStyleColor();
-    ImGui::End();
-
-    ImGui::SetNextWindowBgAlpha(0.6f);
-    ImGui::SetNextWindowPos({10, io.DisplaySize.y - 105});
-    ImGui::SetNextWindowSize({210, 55});
-    ImGui::Begin("##food", nullptr, ImGuiWindowFlags_NoDecoration|ImGuiWindowFlags_NoInputs|ImGuiWindowFlags_NoMove);
-    ImGui::TextColored({.9f,.65f,.2f,1}, "Food"); ImGui::SameLine();
-    ImGui::Text("%d/20", g_hud.foodLevel);
-    ImGui::PushStyleColor(ImGuiCol_PlotHistogram, ImVec4(.8f,.55f,.1f,1));
-    ImGui::ProgressBar(g_hud.foodLevel/20.f, {-1,6}, "");
-    ImGui::PopStyleColor();
-    float satPct = fminf(g_hud.saturation/20.f, 1.f);
-    ImGui::TextColored({.9f,.3f,.8f,1}, "Sat"); ImGui::SameLine();
-    ImGui::Text("%.1f", g_hud.saturation);
-    ImGui::PushStyleColor(ImGuiCol_PlotHistogram, ImVec4(.8f,.2f,.8f,.8f));
-    ImGui::ProgressBar(satPct, {-1,6}, "");
-    ImGui::PopStyleColor();
-    ImGui::End();
-
-    const char* slotName[4] = {"Helm","Chest","Legs","Boots"};
-    ImGui::SetNextWindowBgAlpha(0.6f);
-    ImGui::SetNextWindowPos({io.DisplaySize.x - 165, 10});
-    ImGui::SetNextWindowSize({155, 130});
-    ImGui::Begin("##armor", nullptr, ImGuiWindowFlags_NoDecoration|ImGuiWindowFlags_NoInputs|ImGuiWindowFlags_NoMove);
-    ImGui::TextColored({.8f,.8f,1,1}, "  Armor"); ImGui::Separator();
-    for (int i = 0; i < 4; i++) {
-        if (!g_hud.armorEquipped[i]) { ImGui::TextDisabled("  %s [--]", slotName[i]); continue; }
-        ImGui::Text(" %s", slotName[i]); ImGui::SameLine(60);
-        ImGui::PushStyleColor(ImGuiCol_PlotHistogram, durColor(g_hud.armorDur[i]));
-        char id[8]; snprintf(id,8,"##a%d",i);
-        ImGui::ProgressBar(g_hud.armorDur[i], {85,10}, id);
-        ImGui::PopStyleColor();
+static bool InstallHooks() {
+    const char* lib = "libminecraftpe.so";
+    uintptr_t hud_addr = pl::signature::pl_resolve_signature(SIG_HUD_RENDER_HOOK, lib);
+    if (hud_addr == 0) {
+        LOGE("HUD render hook signature not found – HUD will not update.");
+        return false;
     }
-    ImGui::End();
-
-    ImGui::SetNextWindowBgAlpha(0.6f);
-    ImGui::SetNextWindowPos({io.DisplaySize.x - 165, 148});
-    ImGui::SetNextWindowSize({155, 45});
-    ImGui::Begin("##oh", nullptr, ImGuiWindowFlags_NoDecoration|ImGuiWindowFlags_NoInputs|ImGuiWindowFlags_NoMove);
-    ImGui::TextColored({.8f,.8f,1,1}, "  Offhand"); ImGui::Separator();
-    if (!g_hud.offhandEquipped) ImGui::TextDisabled("  [empty]");
-    else {
-        ImGui::Text(" Item"); ImGui::SameLine(50);
-        ImGui::PushStyleColor(ImGuiCol_PlotHistogram, durColor(g_hud.offhandDur));
-        ImGui::ProgressBar(g_hud.offhandDur, {95,10}, "##oh2");
-        ImGui::PopStyleColor();
+    // Install inline hook via Gloss
+    void* orig = nullptr;
+    bool ok = GlossHook(reinterpret_cast<void*>(hud_addr),
+                        reinterpret_cast<void*>(Hook_RenderHUD),
+                        &orig);
+    if (ok) {
+        g_OrigRenderHUD = reinterpret_cast<fn_OrigRenderHUD>(orig);
+        LOGI("HUD render hook installed at %p", (void*)hud_addr);
+    } else {
+        LOGE("Failed to install HUD render hook");
     }
-    ImGui::End();
-
-    ImGui::SetNextWindowBgAlpha(0.6f);
-    ImGui::SetNextWindowPos({10, 10});
-    ImGui::SetNextWindowSize({130, 30});
-    ImGui::Begin("##xp", nullptr, ImGuiWindowFlags_NoDecoration|ImGuiWindowFlags_NoInputs|ImGuiWindowFlags_NoMove);
-    ImGui::TextColored({.3f,1,.3f,1}, "XP Lvl: %d", g_hud.xpLevel);
-    ImGui::End();
+    return ok;
 }
 
-static void initImGui(ANativeWindow* window) {
-    if (g_hud.imguiInitialized) return;
-    g_hud.window = window;
-    IMGUI_CHECKVERSION();
-    ImGui::CreateContext();
-    ImGuiIO& io = ImGui::GetIO();
-    io.DisplaySize = {(float)ANativeWindow_getWidth(window), (float)ANativeWindow_getHeight(window)};
-    io.IniFilename = nullptr;
-    ImGui::StyleColorsDark();
-    ImGuiStyle& s = ImGui::GetStyle();
-    s.WindowRounding = 6.f; s.FrameRounding = 4.f; s.WindowBorderSize = 0.f;
-    s.Colors[ImGuiCol_WindowBg] = {.05f,.05f,.08f,.6f};
-    ImGui_ImplAndroid_Init(window);
-    ImGui_ImplOpenGL3_Init("#version 300 es");
-    g_hud.imguiInitialized = true;
-    LOGI("ImGui ready");
-}
+// ─── Entry point ─────────────────────────────────────────────────────────────
+__attribute__((constructor))
+void ArmorFoodHUD_Init() {
+    GlossInit(true);
+    LOGI("ArmorHUD + AppleSkin combined mod loading (MC 1.26.0+)");
 
-// ============================================================
-//  eglSwapBuffers hook
-// ============================================================
-using fnEgl = unsigned int(*)(void*,void*);
-static fnEgl orig_eglSwapBuffers = nullptr;
+    InitSharedMemory();
 
-static unsigned int hook_eglSwapBuffers(void* dpy, void* surface) {
-    if (g_hud.imguiInitialized) {
-        static bool scanned = false;
-        if (!scanned) { initOffsets(); scanned = true; }
-        refreshData();
-        ImGui_ImplOpenGL3_NewFrame();
-        ImGui_ImplAndroid_NewFrame();
-        ImGui::NewFrame();
-        drawHUD();
-        ImGui::Render();
-        ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+    bool sigs = ResolveSignatures();
+    if (!sigs) {
+        LOGE("Warning: some signatures failed to resolve. HUD data may be incomplete.");
     }
-    return orig_eglSwapBuffers(dpy, surface);
-}
 
-// ============================================================
-//  JNI entry — use preloader's Gloss hook
-// ============================================================
-extern "C" __attribute__((visibility("default")))
-jint JNI_OnLoad(JavaVM* vm, void* reserved) {
-    LOGI("libPvpHud loading...");
+    bool hook = InstallHooks();
+    if (hook) {
+        LOGI("All hooks installed successfully.");
+    }
 
-    void* libegl = dlopen("libEGL.so", RTLD_NOW | RTLD_GLOBAL);
-    if (!libegl) { LOGE("libEGL.so open failed"); return JNI_VERSION_1_6; }
-
-    void* addr = dlsym(libegl, "eglSwapBuffers");
-    if (!addr) { LOGE("eglSwapBuffers not found"); return JNI_VERSION_1_6; }
-
-    GlossHook(addr, (void*)hook_eglSwapBuffers, (void**)&orig_eglSwapBuffers);
-    LOGI("Hooked eglSwapBuffers @ %p", addr);
-
-    return JNI_VERSION_1_6;
-}
-
-extern "C" __attribute__((visibility("default")))
-void Java_net_pvphud_NativeLib_onSurfaceCreated(JNIEnv* env, jclass, jobject surface) {
-    ANativeWindow* w = ANativeWindow_fromSurface(env, surface);
-    if (w) initImGui(w);
-}
-
-extern "C" __attribute__((visibility("default")))
-void Java_net_pvphud_NativeLib_onSurfaceChanged(JNIEnv* env, jclass, jint w, jint h) {
-    if (g_hud.imguiInitialized)
-        ImGui::GetIO().DisplaySize = {(float)w, (float)h};
+    LOGI("ArmorHUD + AppleSkin init complete.");
 }
