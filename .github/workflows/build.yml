@@ -1,19 +1,6 @@
-# 1. Clone pl dependencies
-mkdir -p deps/pl
-git clone https://github.com/SYsstemXD/Gloss deps/pl/gloss
-git clone https://github.com/Suicolen/Signature deps/pl/sig
-# Merge headers: copy Gloss.h, Signature.h into deps/pl/include/pl/
-# Merge sources: copy *.cpp into deps/pl/src/
-
-# 2. Configure (replace $NDK with your NDK path)
-cmake \
-  -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake \
-  -DANDROID_ABI=arm64-v8a \
-  -DANDROID_PLATFORM=android-26 \
-  -DCMAKE_BUILD_TYPE=Release \
-  -B build
-
-# 3. Build
-cmake --build build
-
-# Output: build/ArmorFoodHUD.so
+- name: Build ArmorFoodHUD
+  run: |
+    cmake -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK/build/cmake/android.toolchain.cmake \
+          -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-26 \
+          -DCMAKE_BUILD_TYPE=Release -B build
+    cmake --build build
