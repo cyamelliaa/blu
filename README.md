@@ -1,6 +1,6 @@
 # ArmorHUD + AppleSkin — Bedrock Native Mod
 
-Port of **uku's Armor HUD** + **AppleSkin** to Minecraft Bedrock 1.26.0+ for [LeviLaminar](https://github.com/...) (Levi Launcher, mobile).
+Port of **uku's Armor HUD** + **AppleSkin** to Minecraft Bedrock 1.26.0+ for [LeviLaunchroid](https://github.com/LiteLDev/LeviLaunchroid) (Levi Launcher, mobile).
 
 ## Features
 
