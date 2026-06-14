@@ -14,6 +14,7 @@
 #include <vector>
 #include <unistd.h>
 
+#include "pl/Hook.h"
 #include "pl/Gloss.h"
 #include "ImGui/imgui.h"
 #include "ImGui/backends/imgui_impl_opengl3.h"
@@ -330,7 +331,7 @@ jint JNI_OnLoad(JavaVM* vm, void* reserved) {
     void* addr = dlsym(libegl, "eglSwapBuffers");
     if (!addr) { LOGE("eglSwapBuffers not found"); return JNI_VERSION_1_6; }
 
-    A64HookFunction(addr, (void*)hook_eglSwapBuffers, (void**)&orig_eglSwapBuffers);
+    GlossHook(addr, (void*)hook_eglSwapBuffers, (void**)&orig_eglSwapBuffers);
     LOGI("Hooked eglSwapBuffers @ %p", addr);
 
     return JNI_VERSION_1_6;
