@@ -1,4 +1,8 @@
 cmake_minimum_required(VERSION 3.18)
+
+# CMP0002: allow redefining targets (safety net if old files linger in the repo)
+cmake_policy(SET CMP0002 OLD)
+
 project(ArmorFoodHUDProject LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
@@ -12,30 +16,15 @@ include(FetchContent)
 set(FETCHCONTENT_QUIET OFF)
 
 # ── Dobby ─────────────────────────────────────────────────────────────────────
-set(DOBBY_BUILD_SHARED OFF CACHE BOOL "" FORCE)
-set(DOBBY_DEBUG        OFF CACHE BOOL "" FORCE)
+set(DOBBY_BUILD_SHARED  OFF CACHE BOOL "" FORCE)
+set(DOBBY_BUILD_EXAMPLE OFF CACHE BOOL "" FORCE)
+set(DOBBY_DEBUG         OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(dobby
     GIT_REPOSITORY https://github.com/jmpews/Dobby.git
     GIT_TAG        master
     GIT_SHALLOW    TRUE
 )
 FetchContent_MakeAvailable(dobby)
-
-# patch: dobby's arm64 closure bridge asm uses macOS-only @PAGE/@PAGEOFF
-# relocations, which clang's integrated assembler rejects for ELF
-# (android) targets. make it conditional on __APPLE__, use ELF :lo12:
-# syntax otherwise.
-set(_dobby_arm64_asm "${dobby_SOURCE_DIR}/source/TrampolineBridge/ClosureTrampolineBridge/arm64/closure_bridge_arm64.asm")
-file(READ "${_dobby_arm64_asm}" _asm)
-string(REPLACE
-    "adrp TMP_REG_0, cdecl(common_closure_bridge_handler)@PAGE"
-    "#if defined(__APPLE__)\nadrp TMP_REG_0, cdecl(common_closure_bridge_handler)@PAGE\n#else\nadrp TMP_REG_0, cdecl(common_closure_bridge_handler)\n#endif"
-    _asm "${_asm}")
-string(REPLACE
-    "add TMP_REG_0, TMP_REG_0, cdecl(common_closure_bridge_handler)@PAGEOFF"
-    "#if defined(__APPLE__)\nadd TMP_REG_0, TMP_REG_0, cdecl(common_closure_bridge_handler)@PAGEOFF\n#else\nadd TMP_REG_0, TMP_REG_0, :lo12:cdecl(common_closure_bridge_handler)\n#endif"
-    _asm "${_asm}")
-file(WRITE "${_dobby_arm64_asm}" "${_asm}")
 
 # ── Dear ImGui ────────────────────────────────────────────────────────────────
 FetchContent_Declare(imgui
@@ -53,8 +42,8 @@ FetchContent_Declare(stb
 )
 FetchContent_MakeAvailable(stb)
 
-# ── Generate pl/Gloss.h (Dobby wrapper) ───────────────────────────────────────
-set(PL_DIR "${CMAKE_BINARY_DIR}/pl_generated")
+# ── Generate pl/Gloss.h ───────────────────────────────────────────────────────
+set(PL_DIR "${CMAKE_BINARY_DIR}/pl_headers")
 file(MAKE_DIRECTORY "${PL_DIR}/pl")
 
 file(WRITE "${PL_DIR}/pl/Gloss.h" [[
@@ -63,13 +52,13 @@ file(WRITE "${PL_DIR}/pl/Gloss.h" [[
 #include <cstdint>
 #include "dobby.h"
 typedef void* GHandle;
-inline void      GlossInit(bool)                              {}
-inline GHandle   GlossOpen(const char* lib)                   { return dlopen(lib, RTLD_NOW | RTLD_NOLOAD); }
+inline void      GlossInit(bool)                               {}
+inline GHandle   GlossOpen(const char* lib)                    { return dlopen(lib, RTLD_NOW | RTLD_NOLOAD); }
 inline uintptr_t GlossSymbol(GHandle h, const char* s, void*) { return h ? (uintptr_t)dlsym(h,s) : 0; }
 inline bool      GlossHook(void* t, void* r, void** o)        { return DobbyHook(t,r,o) == 0; }
 ]])
 
-# ── Generate pl/Signature.h (ARM64 pattern scanner) ───────────────────────────
+# ── Generate pl/Signature.h ───────────────────────────────────────────────────
 file(WRITE "${PL_DIR}/pl/Signature.h" [[
 #pragma once
 #include <cstdint>
@@ -77,22 +66,18 @@ file(WRITE "${PL_DIR}/pl/Signature.h" [[
 #include <cstdlib>
 #include <dlfcn.h>
 #include <link.h>
-
 namespace pl::signature {
-
 static uintptr_t pl_resolve_signature(const char* pattern, const char* libname) {
     uint8_t pat[512]; bool mask[512]; size_t len = 0;
     for (const char* p = pattern; *p && len < 512; ) {
         while (*p == ' ') p++;
         if (!*p) break;
         if (*p == '?') { pat[len]=0; mask[len++]=false; p++; if(*p=='?')p++; }
-        else           { pat[len]=(uint8_t)strtoul(p,nullptr,16); mask[len++]=true; p+=2; }
+        else { pat[len]=(uint8_t)strtoul(p,nullptr,16); mask[len++]=true; p+=2; }
     }
     if (!len) return 0;
-
     struct Ctx { const char* lib; const uint8_t* pat; const bool* mask; size_t len; uintptr_t result; };
-    Ctx ctx { libname, pat, mask, len, 0 };
-
+    Ctx ctx{libname, pat, mask, len, 0};
     dl_iterate_phdr([](struct dl_phdr_info* info, size_t, void* data) -> int {
         auto* c = (Ctx*)data;
         if (!info->dlpi_name || !strstr(info->dlpi_name, c->lib)) return 0;
@@ -100,7 +85,7 @@ static uintptr_t pl_resolve_signature(const char* pattern, const char* libname) 
             auto& ph = info->dlpi_phdr[i];
             if (ph.p_type != PT_LOAD || !(ph.p_flags & 1)) continue;
             auto* base = (const uint8_t*)(info->dlpi_addr + ph.p_vaddr);
-            size_t sz  = ph.p_filesz;
+            size_t sz = ph.p_filesz;
             for (size_t off = 0; off + c->len <= sz; off += 4) {
                 bool ok = true;
                 for (size_t j = 0; j < c->len && ok; j++)
@@ -110,10 +95,8 @@ static uintptr_t pl_resolve_signature(const char* pattern, const char* libname) 
         }
         return 0;
     }, &ctx);
-
     return ctx.result;
 }
-
 } // namespace pl::signature
 ]])
 
@@ -126,22 +109,22 @@ include_directories(
     ${stb_SOURCE_DIR}
 )
 
-# ── Our mod — named differently from Dobby's internal targets ─────────────────
-add_library(mod SHARED
-    src/main.cpp
-    ${imgui_SOURCE_DIR}/imgui.cpp
-    ${imgui_SOURCE_DIR}/imgui_draw.cpp
-    ${imgui_SOURCE_DIR}/imgui_tables.cpp
-    ${imgui_SOURCE_DIR}/imgui_widgets.cpp
-    ${imgui_SOURCE_DIR}/backends/imgui_impl_opengl3.cpp
-    ${imgui_SOURCE_DIR}/backends/imgui_impl_android.cpp
-)
-
-target_link_libraries(mod PRIVATE
-    dobby log android EGL GLESv3 GLESv2
-)
-
-set_target_properties(mod PROPERTIES
-    OUTPUT_NAME "ArmorFoodHUD"
-    PREFIX ""
-)
+# ── Mod target (uniquely named to avoid any possible clash) ───────────────────
+if(NOT TARGET armorfoodnud_mod)
+    add_library(armorfoodnud_mod SHARED
+        src/main.cpp
+        ${imgui_SOURCE_DIR}/imgui.cpp
+        ${imgui_SOURCE_DIR}/imgui_draw.cpp
+        ${imgui_SOURCE_DIR}/imgui_tables.cpp
+        ${imgui_SOURCE_DIR}/imgui_widgets.cpp
+        ${imgui_SOURCE_DIR}/backends/imgui_impl_opengl3.cpp
+        ${imgui_SOURCE_DIR}/backends/imgui_impl_android.cpp
+    )
+    target_link_libraries(armorfoodnud_mod PRIVATE
+        dobby_static log android EGL GLESv3 GLESv2
+    )
+    set_target_properties(armorfoodnud_mod PROPERTIES
+        OUTPUT_NAME "ArmorFoodHUD"
+        PREFIX ""
+    )
+endif()
