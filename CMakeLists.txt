@@ -1,9 +1,6 @@
 cmake_minimum_required(VERSION 3.18)
-
-# CMP0002: allow redefining targets (safety net if old files linger in the repo)
 cmake_policy(SET CMP0002 OLD)
-
-project(ArmorFoodHUDProject LANGUAGES C CXX)
+project(ArmorFoodHUDProject LANGUAGES C CXX ASM)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -25,6 +22,19 @@ FetchContent_Declare(dobby
     GIT_SHALLOW    TRUE
 )
 FetchContent_MakeAvailable(dobby)
+
+# ── Patch Dobby's ARM64 ASM: replace Apple @PAGE/@PAGEOFF with Linux :lo12: ──
+# This file uses macOS Mach-O relocation syntax that clang rejects on ELF targets.
+set(DOBBY_ASM
+    "${dobby_SOURCE_DIR}/source/TrampolineBridge/ClosureTrampolineBridge/arm64/closure_bridge_arm64.asm"
+)
+file(READ "${DOBBY_ASM}" DOBBY_ASM_CONTENT)
+string(REPLACE
+    "adrp TMP_REG_0, cdecl(common_closure_bridge_handler)@PAGE\nadd TMP_REG_0, TMP_REG_0, cdecl(common_closure_bridge_handler)@PAGEOFF"
+    "adrp TMP_REG_0, cdecl(common_closure_bridge_handler)\nadd TMP_REG_0, TMP_REG_0, :lo12:cdecl(common_closure_bridge_handler)"
+    DOBBY_ASM_CONTENT "${DOBBY_ASM_CONTENT}"
+)
+file(WRITE "${DOBBY_ASM}" "${DOBBY_ASM_CONTENT}")
 
 # ── Dear ImGui ────────────────────────────────────────────────────────────────
 FetchContent_Declare(imgui
@@ -109,7 +119,7 @@ include_directories(
     ${stb_SOURCE_DIR}
 )
 
-# ── Mod target (uniquely named to avoid any possible clash) ───────────────────
+# ── Mod target ────────────────────────────────────────────────────────────────
 if(NOT TARGET armorfoodnud_mod)
     add_library(armorfoodnud_mod SHARED
         src/main.cpp
