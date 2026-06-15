@@ -84,7 +84,7 @@ inline bool GlossHook(void* target, void* replacement, void** orig) {
     t[1] = 0xD61F0200u; // BR  X16
     uintptr_t resume = (uintptr_t)target + 16;
     memcpy(&t[2], &resume, 8);
-    __builtin___clear_cache(tramp, tramp + 36);
+    __builtin___clear_cache((char*)tramp, (char*)tramp + 36);
 
     if (orig) *orig = (void*)tramp;
 
@@ -100,7 +100,7 @@ inline bool GlossHook(void* target, void* replacement, void** orig) {
     tgt[1] = 0xD61F0220u; // BR  X17
     uintptr_t raddr = (uintptr_t)replacement;
     memcpy(&tgt[2], &raddr, 8);
-    __builtin___clear_cache(target, (uint8_t*)target + 16);
+    __builtin___clear_cache((char*)target, (char*)target + 16);
 
     mprotect((void*)page, pgsz, PROT_READ | PROT_EXEC);
     return true;
