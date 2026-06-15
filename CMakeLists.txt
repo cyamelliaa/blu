@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.18)
 cmake_policy(SET CMP0002 OLD)
-project(ArmorFoodHUDProject LANGUAGES C CXX ASM)
+project(ArmorFoodHUDProject LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -11,30 +11,6 @@ set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,--gc-sections,--
 
 include(FetchContent)
 set(FETCHCONTENT_QUIET OFF)
-
-# ── Dobby ─────────────────────────────────────────────────────────────────────
-set(DOBBY_BUILD_SHARED  OFF CACHE BOOL "" FORCE)
-set(DOBBY_BUILD_EXAMPLE OFF CACHE BOOL "" FORCE)
-set(DOBBY_DEBUG         OFF CACHE BOOL "" FORCE)
-FetchContent_Declare(dobby
-    GIT_REPOSITORY https://github.com/jmpews/Dobby.git
-    GIT_TAG        master
-    GIT_SHALLOW    TRUE
-)
-FetchContent_MakeAvailable(dobby)
-
-# ── Patch Dobby's ARM64 ASM: replace Apple @PAGE/@PAGEOFF with Linux :lo12: ──
-# This file uses macOS Mach-O relocation syntax that clang rejects on ELF targets.
-set(DOBBY_ASM
-    "${dobby_SOURCE_DIR}/source/TrampolineBridge/ClosureTrampolineBridge/arm64/closure_bridge_arm64.asm"
-)
-file(READ "${DOBBY_ASM}" DOBBY_ASM_CONTENT)
-string(REPLACE
-    "adrp TMP_REG_0, cdecl(common_closure_bridge_handler)@PAGE\nadd TMP_REG_0, TMP_REG_0, cdecl(common_closure_bridge_handler)@PAGEOFF"
-    "adrp TMP_REG_0, cdecl(common_closure_bridge_handler)\nadd TMP_REG_0, TMP_REG_0, :lo12:cdecl(common_closure_bridge_handler)"
-    DOBBY_ASM_CONTENT "${DOBBY_ASM_CONTENT}"
-)
-file(WRITE "${DOBBY_ASM}" "${DOBBY_ASM_CONTENT}")
 
 # ── Dear ImGui ────────────────────────────────────────────────────────────────
 FetchContent_Declare(imgui
@@ -52,20 +28,83 @@ FetchContent_Declare(stb
 )
 FetchContent_MakeAvailable(stb)
 
-# ── Generate pl/Gloss.h ───────────────────────────────────────────────────────
+# ── Generate pl/Gloss.h (no Dobby — pure mmap inline hook) ───────────────────
 set(PL_DIR "${CMAKE_BINARY_DIR}/pl_headers")
 file(MAKE_DIRECTORY "${PL_DIR}/pl")
 
 file(WRITE "${PL_DIR}/pl/Gloss.h" [[
 #pragma once
+// pl/Gloss.h — zero-dependency inline hook for ARM64 Android
+// Replaces Dobby. Uses mmap RWX trampoline + PatchMemory BL patch.
 #include <dlfcn.h>
 #include <cstdint>
-#include "dobby.h"
+#include <cstring>
+#include <sys/mman.h>
+
 typedef void* GHandle;
-inline void      GlossInit(bool)                               {}
-inline GHandle   GlossOpen(const char* lib)                    { return dlopen(lib, RTLD_NOW | RTLD_NOLOAD); }
-inline uintptr_t GlossSymbol(GHandle h, const char* s, void*) { return h ? (uintptr_t)dlsym(h,s) : 0; }
-inline bool      GlossHook(void* t, void* r, void** o)        { return DobbyHook(t,r,o) == 0; }
+
+inline void GlossInit(bool) {}
+
+inline GHandle GlossOpen(const char* lib) {
+    return dlopen(lib, RTLD_NOW | RTLD_NOLOAD);
+}
+
+inline uintptr_t GlossSymbol(GHandle h, const char* s, void*) {
+    return h ? (uintptr_t)dlsym(h, s) : 0;
+}
+
+// ARM64 inline hook:
+//   1. Allocate RWX page for trampoline (original 4 bytes + absolute jump back)
+//   2. Patch target with LDR+BR to replacement (position-independent, any distance)
+//   3. *orig points to the trampoline so callers can invoke the original
+inline bool GlossHook(void* target, void* replacement, void** orig) {
+    if (!target || !replacement) return false;
+
+    // Allocate trampoline page
+    uint8_t* tramp = (uint8_t*)mmap(nullptr, 4096,
+        PROT_READ | PROT_WRITE | PROT_EXEC,
+        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (tramp == MAP_FAILED) return false;
+
+    // Save original first instruction (we overwrite 16 bytes: LDR+BR+addr)
+    uint32_t orig_insn[4];
+    memcpy(orig_insn, target, sizeof(orig_insn));
+
+    // Trampoline layout:
+    //   [0] = original instruction 0  (saved)
+    //   [1] = original instruction 1  (saved, in case hook is 8 bytes)
+    //   [2] = original instruction 2  (saved)
+    //   [3] = original instruction 3  (saved)
+    //   [4] LDR X16, #8
+    //   [5] BR  X16
+    //   [6..7] = (target + 16) as 64-bit absolute address (continue after hook)
+    memcpy(tramp, orig_insn, 16);
+    uint32_t* t = (uint32_t*)(tramp + 16);
+    t[0] = 0x58000050u; // LDR X16, #8
+    t[1] = 0xD61F0200u; // BR  X16
+    uintptr_t resume = (uintptr_t)target + 16;
+    memcpy(&t[2], &resume, 8);
+    __builtin___clear_cache(tramp, tramp + 36);
+
+    if (orig) *orig = (void*)tramp;
+
+    // Patch target: LDR X17, #8 / BR X17 / .quad replacement
+    // This is 16 bytes — covers the 4 saved instructions
+    uintptr_t page   = (uintptr_t)target & ~(uintptr_t)4095;
+    size_t    pgsz   = ((uintptr_t)target + 16 - page + 4095) & ~(size_t)4095;
+    if (mprotect((void*)page, pgsz, PROT_READ | PROT_WRITE | PROT_EXEC) != 0)
+        return false;
+
+    uint32_t* tgt = (uint32_t*)target;
+    tgt[0] = 0x58000051u; // LDR X17, #8
+    tgt[1] = 0xD61F0220u; // BR  X17
+    uintptr_t raddr = (uintptr_t)replacement;
+    memcpy(&tgt[2], &raddr, 8);
+    __builtin___clear_cache(target, (uint8_t*)target + 16);
+
+    mprotect((void*)page, pgsz, PROT_READ | PROT_EXEC);
+    return true;
+}
 ]])
 
 # ── Generate pl/Signature.h ───────────────────────────────────────────────────
@@ -131,7 +170,7 @@ if(NOT TARGET armorfoodnud_mod)
         ${imgui_SOURCE_DIR}/backends/imgui_impl_android.cpp
     )
     target_link_libraries(armorfoodnud_mod PRIVATE
-        dobby_static log android EGL GLESv3 GLESv2
+        log android EGL GLESv3 GLESv2
     )
     set_target_properties(armorfoodnud_mod PROPERTIES
         OUTPUT_NAME "ArmorFoodHUD"
